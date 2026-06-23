@@ -1,0 +1,14 @@
+{
+  "name": "claude-codex-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Bidirectional local bridge experiments between Claude Desktop Code sessions and Codex desktop threads.",
+  "bin": {
+    "codex-bridge": "./scripts/codex_bridge.mjs",
+    "claude-code-bridge": "./scripts/claude_code_bridge.mjs"
+  },
+  "scripts": {
+    "check": "node --check scripts/codex_bridge.mjs && node --check scripts/claude_code_bridge.mjs"
+  }
+}

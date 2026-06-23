@@ -1,0 +1,27 @@
+.env
+.env.*
+!.env.example
+*.local
+*.log
+*.tmp
+*.bak
+*.backup
+*.codex-backup-*
+node_modules/
+dist/
+coverage/
+.DS_Store
+Thumbs.db
+
+# Local app/session/auth state. Never commit live transcripts or credentials.
+.claude/
+.codex/
+auth.json
+credentials.json
+Local State
+config.json
+*.jsonl
+*.pem
+*.key
+*.p12
+*.pfx
