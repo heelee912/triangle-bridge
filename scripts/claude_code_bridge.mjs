@@ -2227,10 +2227,11 @@ function runLiveStdinHelper(parentPid, childPid, jsonLine) {
       String(parentPid),
       "-ChildPid",
       String(childPid),
+      "-StdinBase64",
     ],
     {
       encoding: "utf8",
-      input: jsonLine,
+      input: Buffer.from(jsonLine, "utf8").toString("base64"),
       timeout: 15000,
       windowsHide: true,
     },

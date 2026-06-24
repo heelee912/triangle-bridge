@@ -1,12 +1,19 @@
 param(
   [Parameter(Mandatory = $true)][int]$ParentPid,
   [Parameter(Mandatory = $true)][int]$ChildPid,
-  [string]$JsonLine
+  [string]$JsonLine,
+  [string]$JsonLineBase64,
+  [switch]$StdinBase64
 )
 
 $ErrorActionPreference = "Stop"
 
-if (-not $PSBoundParameters.ContainsKey("JsonLine")) {
+if ($PSBoundParameters.ContainsKey("JsonLineBase64")) {
+  $JsonLine = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($JsonLineBase64.Trim()))
+} elseif ($StdinBase64) {
+  $stdinText = [Console]::In.ReadToEnd()
+  $JsonLine = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($stdinText.Trim()))
+} elseif (-not $PSBoundParameters.ContainsKey("JsonLine")) {
   $JsonLine = [Console]::In.ReadToEnd()
   if ($JsonLine.EndsWith("`r`n")) {
     $JsonLine = $JsonLine.Substring(0, $JsonLine.Length - 2)

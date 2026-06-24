@@ -116,7 +116,7 @@ For raw mode, run `raw probe` first. If `rawIpc.available` is `false`, do not se
 
 For Code live-stdin mode, `bridge.available=false` and `rawIpc.available=false` are acceptable, but a matching running Claude Desktop `claude-code --resume <cliSessionId>` child process must exist. This does not sync or store OAuth tokens.
 
-For long prompts, prefer `--prompt-file`. Windows command-line argument length is limited; the bridge avoids that limit internally for `live-stdin` by passing the stream-json frame to the PowerShell helper over stdin instead of a `-JsonLine` argument.
+For long or non-ASCII prompts, prefer `--prompt-file`. Windows command-line argument length is limited, and Windows PowerShell text stdin can reinterpret UTF-8 through the active codepage. The bridge avoids both issues internally for `live-stdin` by passing a Base64-encoded UTF-8 stream-json frame to the PowerShell helper over stdin instead of a `-JsonLine` argument.
 
 For Code CLI resume mode, `bridge.available=false` and `rawIpc.available=false` are acceptable. The CLI must verify `claudeCodeCli.executable` and run `auth-sync` automatically unless `--no-auth-sync` is set.
 

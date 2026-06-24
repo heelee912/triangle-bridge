@@ -87,7 +87,7 @@ renderer -> raw -> live-stdin -> cli
 
 `live-stdin` requires a matching already-running Claude Desktop `claude-code --resume <cliSessionId>` child process. The Claude app does not need to have that window focused, but the child process must be alive.
 
-For long prompts, prefer `--prompt-file`. Windows command-line argument length is limited; the bridge avoids that limit internally for `live-stdin` by passing the stream-json frame to the PowerShell helper over stdin instead of a `-JsonLine` argument.
+For long or non-ASCII prompts, prefer `--prompt-file`. Windows command-line argument length is limited, and Windows PowerShell text stdin can reinterpret UTF-8 through the active codepage. The bridge avoids both issues internally for `live-stdin` by passing a Base64-encoded UTF-8 stream-json frame to the PowerShell helper over stdin instead of a `-JsonLine` argument.
 
 ## Security Notes
 
