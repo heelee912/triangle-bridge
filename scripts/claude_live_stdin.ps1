@@ -200,10 +200,9 @@ public static class ClaudeLiveStdinWriter {
     int stdoutIndex = int.Parse(stdoutMatch.Groups[1].Value);
     int stderrIndex = int.Parse(stderrMatch.Groups[1].Value);
     int stdinIndex = Math.Min(stdoutIndex, stderrIndex) - 1;
-    if (stdinIndex < 1) throw new Exception("Invalid inferred stdin index. stdout=" + stdoutName + " stderr=" + stderrName);
 
     var targetSuffixes = new List<string>();
-    targetSuffixes.Add("\\uv\\" + stdinIndex + "-" + parentPid);
+    if (stdinIndex >= 0) targetSuffixes.Add("\\uv\\" + stdinIndex + "-" + parentPid);
     // Recent Claude/Electron builds can expose the app-owned stdin pipe with the libuv
     // underflow sentinel instead of the adjacent stdout/stderr index.
     string underflowSuffix = "\\uv\\" + UInt64.MaxValue.ToString() + "-" + parentPid;
