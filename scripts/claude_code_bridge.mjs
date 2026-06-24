@@ -348,9 +348,38 @@ function blockText(block) {
   if (typeof block === "string") return block;
   if (typeof block.text === "string") return block.text;
   if (typeof block.content === "string") return block.content;
-  if (block.type === "tool_use") return `[tool_use:${block.name || block.id || "unknown"}]`;
+  if (block.type === "tool_use") return toolUseText(block);
   if (block.type === "tool_result") return "[tool_result]";
   return "";
+}
+
+function truncateText(value, maxChars = 1200) {
+  const text = String(value || "");
+  return text.length > maxChars ? `${text.slice(0, maxChars)}...` : text;
+}
+
+function toolUseText(block) {
+  const name = block.name || block.id || "unknown";
+  if (name !== "AskUserQuestion") return `[tool_use:${name}]`;
+
+  const questions = Array.isArray(block.input?.questions) ? block.input.questions : [];
+  if (!questions.length) {
+    return `[tool_use:${name}]\n${truncateText(JSON.stringify(block.input || {}, null, 2), 2000)}`;
+  }
+
+  const renderedQuestions = questions.map((question, index) => {
+    const header = question.header ? ` (${question.header})` : "";
+    const lines = [`Question ${index + 1}${header}: ${question.question || ""}`];
+    const options = Array.isArray(question.options) ? question.options : [];
+    for (const option of options) {
+      const label = option.label || "";
+      const description = option.description ? ` - ${option.description}` : "";
+      lines.push(`- ${label}${description}`);
+    }
+    return lines.join("\n");
+  });
+
+  return `[tool_use:${name}]\n${truncateText(renderedQuestions.join("\n\n"), 4000)}`;
 }
 
 function messageText(entry) {
@@ -2703,6 +2732,22 @@ async function cmdSelftest() {
   assert(expectedEipcSuffixes("cowork").includes("LocalAgentModeSessions_$_sendMessage"), "cowork eipc suffixes");
   assert(requiredRawIpcSuffixes("code").includes("LocalSessions_$_sendMessage"), "code raw required suffixes");
   assert(requiredRawIpcSuffixes("cowork").includes("LocalAgentModeSessions_$_setEffort"), "cowork raw required suffixes");
+  const askUserQuestionText = blockText({
+    type: "tool_use",
+    name: "AskUserQuestion",
+    input: {
+      questions: [
+        {
+          header: "Decision",
+          question: "Which route should proceed?",
+          options: [{ label: "Route A", description: "Keep the current shape." }],
+        },
+      ],
+    },
+  });
+  assert(askUserQuestionText.includes("Which route should proceed?"), "AskUserQuestion question text");
+  assert(askUserQuestionText.includes("Route A - Keep the current shape."), "AskUserQuestion option text");
+  assert(blockText({ type: "tool_use", name: "Bash", input: { command: "echo hidden" } }) === "[tool_use:Bash]", "generic tool_use stays compact");
 
   const routed = routeCommand({ _: ["cowork", "send"], surface: "code" });
   assert(routed.surface === "cowork" && routed.command === "send", "surface command routing");
