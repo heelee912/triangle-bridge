@@ -71,6 +71,7 @@ Common commands:
 - `code send --raw-ipc --prompt "..." --cwd PATH`: raw eIPC mode from the normal Code command.
 - `code send --transport cli --prompt "..." --cwd PATH`: send through Claude Code CLI resume, syncing Desktop OAuth first.
 - `code send --transport live-stdin --prompt "..." --cwd PATH`: send into the already-running Claude Desktop Code child process for the matching session.
+- `code send --transport live-stdin --prompt-file PATH --cwd PATH`: send a long prompt without putting the prompt body on the Windows command line.
 - `auth-sync`: sync Claude Desktop OAuth into Claude Code CLI credentials without sending.
 - `wait`: wait for a new assistant transcript entry.
 - `read`: read recent transcript entries.
@@ -114,6 +115,8 @@ For wrapper mode, if `bridge.available` is `false`, do not send through the wrap
 For raw mode, run `raw probe` first. If `rawIpc.available` is `false`, do not send through raw IPC.
 
 For Code live-stdin mode, `bridge.available=false` and `rawIpc.available=false` are acceptable, but a matching running Claude Desktop `claude-code --resume <cliSessionId>` child process must exist. This does not sync or store OAuth tokens.
+
+For long prompts, prefer `--prompt-file`. Windows command-line argument length is limited; the bridge avoids that limit internally for `live-stdin` by passing the stream-json frame to the PowerShell helper over stdin instead of a `-JsonLine` argument.
 
 For Code CLI resume mode, `bridge.available=false` and `rawIpc.available=false` are acceptable. The CLI must verify `claudeCodeCli.executable` and run `auth-sync` automatically unless `--no-auth-sync` is set.
 

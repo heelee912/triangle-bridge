@@ -76,6 +76,7 @@ Example:
 ```powershell
 node .\scripts\claude_code_bridge.mjs status --cwd "C:\path\to\project" --json
 node .\scripts\claude_code_bridge.mjs code send --cwd "C:\path\to\project" --transport live-stdin --prompt "reply exactly ok" --wait
+node .\scripts\claude_code_bridge.mjs code send --cwd "C:\path\to\project" --transport live-stdin --prompt-file .\prompt.txt --wait
 ```
 
 Automatic Code send transport order:
@@ -85,6 +86,8 @@ renderer -> raw -> live-stdin -> cli
 ```
 
 `live-stdin` requires a matching already-running Claude Desktop `claude-code --resume <cliSessionId>` child process. The Claude app does not need to have that window focused, but the child process must be alive.
+
+For long prompts, prefer `--prompt-file`. Windows command-line argument length is limited; the bridge avoids that limit internally for `live-stdin` by passing the stream-json frame to the PowerShell helper over stdin instead of a `-JsonLine` argument.
 
 ## Security Notes
 

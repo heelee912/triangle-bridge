@@ -1,10 +1,23 @@
 param(
   [Parameter(Mandatory = $true)][int]$ParentPid,
   [Parameter(Mandatory = $true)][int]$ChildPid,
-  [Parameter(Mandatory = $true)][string]$JsonLine
+  [string]$JsonLine
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $PSBoundParameters.ContainsKey("JsonLine")) {
+  $JsonLine = [Console]::In.ReadToEnd()
+  if ($JsonLine.EndsWith("`r`n")) {
+    $JsonLine = $JsonLine.Substring(0, $JsonLine.Length - 2)
+  } elseif ($JsonLine.EndsWith("`n")) {
+    $JsonLine = $JsonLine.Substring(0, $JsonLine.Length - 1)
+  }
+}
+
+if ($JsonLine.Length -eq 0) {
+  throw "JsonLine is empty; pass -JsonLine or pipe JSON to stdin."
+}
 
 $src = @'
 using System;
