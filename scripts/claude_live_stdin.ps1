@@ -202,12 +202,19 @@ public static class ClaudeLiveStdinWriter {
     int stdinIndex = Math.Min(stdoutIndex, stderrIndex) - 1;
     if (stdinIndex < 1) throw new Exception("Invalid inferred stdin index. stdout=" + stdoutName + " stderr=" + stderrName);
 
-    string targetSuffix = "\\uv\\" + stdinIndex + "-" + parentPid;
+    var targetSuffixes = new List<string>();
+    targetSuffixes.Add("\\uv\\" + stdinIndex + "-" + parentPid);
+    // Recent Claude/Electron builds can expose the app-owned stdin pipe with the libuv
+    // underflow sentinel instead of the adjacent stdout/stderr index.
+    string underflowSuffix = "\\uv\\" + UInt64.MaxValue.ToString() + "-" + parentPid;
+    if (!targetSuffixes.Contains(underflowSuffix)) targetSuffixes.Add(underflowSuffix);
+
     var handles = QueryHandles();
     IntPtr parent = OpenProcess(PROCESS_DUP_HANDLE, false, parentPid);
     if (parent == IntPtr.Zero) throw new Exception("OpenProcess parent failed: " + Marshal.GetLastWin32Error());
 
     try {
+      var observedParentPipes = new List<string>();
       foreach (var entry in handles) {
         if (entry.UniqueProcessId.ToUInt64() != (ulong)parentPid) continue;
         ulong handleValue = entry.HandleValue.ToUInt64();
@@ -218,7 +225,16 @@ public static class ClaudeLiveStdinWriter {
         try {
           if (GetFileType(duplicate) != FILE_TYPE_PIPE) continue;
           string name = QueryNameWithTimeout(duplicate, 150);
-          if (!name.EndsWith(targetSuffix, StringComparison.OrdinalIgnoreCase)) continue;
+          if (name.Contains("\\uv\\")) observedParentPipes.Add(name);
+
+          string matchedSuffix = null;
+          foreach (var targetSuffix in targetSuffixes) {
+            if (name.EndsWith(targetSuffix, StringComparison.OrdinalIgnoreCase)) {
+              matchedSuffix = targetSuffix;
+              break;
+            }
+          }
+          if (matchedSuffix == null) continue;
 
           byte[] bytes = Encoding.UTF8.GetBytes(jsonLine + "\n");
           uint written;
@@ -226,6 +242,7 @@ public static class ClaudeLiveStdinWriter {
           int error = Marshal.GetLastWin32Error();
           return "{\"ok\":" + (ok ? "true" : "false") +
             ",\"target\":\"" + EscapeJson(name) +
+            "\",\"candidate\":\"" + EscapeJson(matchedSuffix) +
             "\",\"parentHandle\":\"0x" + handleValue.ToString("X") +
             "\",\"stdout\":\"" + EscapeJson(stdoutName) +
             "\",\"stderr\":\"" + EscapeJson(stderrName) +
@@ -236,7 +253,10 @@ public static class ClaudeLiveStdinWriter {
           CloseHandle(duplicate);
         }
       }
-      throw new Exception("Parent stdin pipe not found: suffix=" + targetSuffix + " stdout=" + stdoutName + " stderr=" + stderrName);
+      throw new Exception("Parent stdin pipe not found: suffixes=" + String.Join(",", targetSuffixes) +
+        " stdout=" + stdoutName +
+        " stderr=" + stderrName +
+        " parentPipes=" + String.Join(",", observedParentPipes));
     } finally {
       CloseHandle(parent);
     }
