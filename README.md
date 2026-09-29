@@ -4,58 +4,51 @@ Local bidirectional bridge experiments between the Claude Desktop app and the Co
 
 This repository contains two independent directions:
 
-- `scripts/codex_bridge.mjs`: Claude-to-Codex. Connects to the live Codex desktop IPC router and sends a user turn to the owner window for an open Codex thread.
+- `scripts/codex_bridge.mjs`: Claude-to-Codex. Calls the running Codex app's native thread tools through a standalone local named-pipe client.
 - `scripts/claude_code_bridge.mjs`: Codex-to-Claude. Sends to Claude Desktop Code sessions through renderer/raw LocalSessions paths when available, or through a live stdin transport for an already-running Claude Code child process.
 
 It does not patch Claude Desktop, Codex, `app.asar`, WindowsApps copies, browser state, or UI controls.
 
 ## Claude to Codex
 
-Codex desktop exposes a live IPC router:
+The default transport discovers the running Codex app's native tool pipe:
 
 ```text
-\\.\pipe\codex-ipc
+\\.\pipe\codex-browser-use-<instance-id>
 ```
 
-The bridge speaks Codex's length-prefixed JSON protocol:
+It uses length-prefixed JSON-RPC:
 
 ```text
 [uint32 little-endian byteLength][utf8 JSON]
 ```
 
-The send path uses:
+The send path is:
 
 ```text
-thread-follower-start-turn
+tools/list -> read_thread (exact target check) -> send_message_to_thread
 ```
 
-with the confirmed schema:
+The target does **not** have to be the visible or focused thread. The app's native send function resumes the specified thread by ID and coordinates active-turn steering or a new turn. Viewing another thread does not change the target. Codex desktop must remain running and its native tool endpoint must be responsive.
 
-```json
-{
-  "conversationId": "<codex-thread-id>",
-  "turnStartParams": {
-    "input": [
-      {
-        "type": "text",
-        "text": "message",
-        "text_elements": []
-      }
-    ],
-    "clientUserMessageId": "<uuid>",
-    "serviceTier": null
-  }
-}
-```
+This implementation has no OmniCodex imports, MCP connection, shared queue, server or configuration dependency. It does not start a separate Codex app-server or alter the target's model settings. Windows pipe discovery is currently supported.
 
 Example:
 
 ```powershell
-node .\scripts\codex_bridge.mjs status
-node .\scripts\codex_bridge.mjs send --conversation-id <thread-id> --prompt "reply exactly bridge ok"
+node .\scripts\codex_bridge.mjs status --thread <thread-id>
+node .\scripts\codex_bridge.mjs send --thread <thread-id> --prompt-file .\message.txt
+node .\scripts\codex_bridge.mjs read --thread <thread-id> --turn-limit 2
+node .\scripts\codex_bridge.mjs --help
 ```
 
-If `--conversation-id` is omitted, the script attempts to use the newest thread ID from the local Codex session index.
+Use a UTF-8 file for Korean or multiline messages. `--conversation-id` remains an alias for `--thread`. Send and read require an explicit ID or an unambiguous `--name`; they do not guess the newest conversation.
+
+`delivery: "app-acknowledged"` means the native send returned the intended thread ID. It does not mean the recipient has completed a reply. A lost acknowledgement is reported as `delivery: "unknown"` and is never automatically resent. Read the target before retrying.
+
+The old `codex-ipc` owner-window protocol is retained only for explicit `--transport ipc` and `raw` diagnostics. It is not the default send path and is not an automatic fallback.
+
+Version 0.2.0 was verified with an actual Claude-originated message received by Codex 26.924.2738.0 while the target turn was active. Foreground independence was checked against the installed app's ID-based resume/send implementation; a separate UI-switch experiment was not performed.
 
 ## Codex to Claude
 
@@ -99,6 +92,7 @@ Before publishing changes, run:
 
 ```powershell
 npm run check
+npm test
 git diff --cached | Select-String -Pattern "password|secret|api[_-]?key|token|authorization|Bearer"
 ```
 
@@ -106,7 +100,9 @@ git diff --cached | Select-String -Pattern "password|secret|api[_-]?key|token|au
 
 ```text
 scripts/
-  codex_bridge.mjs          Claude -> Codex IPC bridge
+  codex_bridge.mjs          Claude -> Codex CLI
+  codex_app_pipe.mjs        Standalone native app-tool pipe transport
+  codex_app_pipe.test.mjs   Framing, Unicode, routing and failure regressions
   claude_code_bridge.mjs    Codex -> Claude Desktop Code/Cowork bridge
   claude_live_stdin.ps1     Windows helper for app-owned Claude Code stdin pipes
 skills/

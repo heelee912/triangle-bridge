@@ -2,7 +2,9 @@
 // codex_bridge.mjs
 // External client for the running OpenAI Codex desktop app's inter-thread IPC bus.
 //
-// Transport (reverse-engineered from app.asar, build 26.616.x):
+// send/read/status use codex_app_pipe.mjs (current desktop native tool pipe).
+// The explicit --transport ipc and raw commands retain the legacy router below.
+// Legacy router transport:
 //   - Windows named pipe: \\.\pipe\codex-ipc  (unix: $TMPDIR/codex-ipc/ipc[-uid].sock)
 //   - A single "router" process binds the pipe; every window/CLI connects as a client.
 //   - Framing: [uint32 LE byteLength][utf8 JSON]   (matches reader fn C3)
@@ -27,6 +29,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
+import { openAppTools, toolParams, decodeToolResult, loadPrompt } from './codex_app_pipe.mjs';
 
 const PIPE = process.platform === "win32"
   ? "\\\\.\\pipe\\codex-ipc"
@@ -34,11 +37,13 @@ const PIPE = process.platform === "win32"
 
 // Per-method protocol version (Vg map from src bundle). Default 0.
 const VERSION = {
-  "thread-stream-state-changed": 7,
+  "thread-stream-state-changed": 11,
+  "thread-stream-following-changed": 1,
+  "thread-owner-discovery": 1,
   "thread-read-state-changed": 1,
   "thread-archived": 2,
   "thread-unarchived": 1,
-  "thread-follower-start-turn": 1,
+  "thread-follower-start-turn": 2,
   "thread-follower-load-complete-history": 1,
   "thread-follower-compact-thread": 1,
   "thread-follower-steer-turn": 1,
@@ -241,6 +246,7 @@ function resolveTarget(args) {
     const { threads } = listThreads();
     const needle = String(name).toLowerCase();
     const matches = threads.filter((t) => (t.name || "").toLowerCase().includes(needle));
+    if (matches.length > 1) throw new Error(`ambiguous thread name: ${name}; pass --thread`);
     const open = matches.filter((t) => t.isOpen);
     const pick = (open[0] || matches[0]);
     if (!pick) throw new Error(`no thread matching name: ${name}`);
@@ -272,6 +278,59 @@ async function main() {
 
   const out = (o) => process.stdout.write(JSON.stringify(o, null, 2) + "\n");
 
+  if (args.help || cmd === 'help') {
+    out({ commands: [
+      'status --thread <Codex thread ID>',
+      'send --thread <Codex thread ID> --prompt-file <UTF-8 file>',
+      'read --thread <Codex thread ID> --turn-limit 2',
+      'list',
+    ], transport: 'Standalone local Codex app tool pipe; no OmniCodex dependency',
+      delivery: 'Send returns the native acknowledgement; read distinguishes queued input from a completed reply. Unknown delivery is not automatically retried.' });
+    return;
+  }
+
+  // Use the app's own send/read path, including its active-turn handling.
+  // This remains a standalone named-pipe client, not an OmniCodex MCP client.
+  if (['send', 'read', 'status'].includes(cmd) && args.transport !== 'ipc') {
+    let pipe;
+    try {
+      if (cmd !== 'status' && !args.thread && !args['conversation-id'] && !args.name) {
+        throw new Error('Pass --thread <exact thread ID> (no implicit latest-thread send/read)');
+      }
+      const conversationId = args.thread || args['conversation-id'] ||
+        (args.name ? resolveTarget(args) : process.env.CODEX_THREAD_ID);
+      if (!conversationId) throw new Error('Pass --thread <exact thread ID>');
+      const prompt = cmd === 'send' ? loadPrompt(args) : undefined;
+      const ready = await openAppTools(conversationId);
+      pipe = ready.pipe;
+      if (cmd === 'status') {
+        out({ ok: true, transport: 'app-tools-pipe', pipe: pipe.endpoint,
+          conversationId, thread: ready.state.thread });
+      } else if (cmd === 'read') {
+        const result = decodeToolResult(await pipe.request('tools/call', toolParams(conversationId,
+          'read_thread', { threadId: conversationId, turnLimit: Number(args['turn-limit'] || 2),
+            includeOutputs: false, maxOutputCharsPerItem: 2000 })));
+        out({ ok: true, conversationId, response: result });
+      } else {
+        const callId = randomUUID();
+        const result = decodeToolResult(await pipe.request('tools/call', toolParams(conversationId,
+          'send_message_to_thread', { threadId: conversationId, prompt }, callId),
+          { mutation: true, timeoutMs: 60000 }));
+        if (result.threadId !== conversationId) {
+          const error = new Error('Send acknowledgement did not identify the intended thread; read before retrying');
+          error.delivery = 'unknown';
+          throw error;
+        }
+        out({ ok: true, transport: 'app-tools-pipe', conversationId, callId,
+          delivery: 'app-acknowledged', response: result });
+      }
+    } catch (error) {
+      out({ ok: false, error: error.message, ...(error.delivery ? { delivery: error.delivery } : {}) });
+      process.exitCode = 1;
+    } finally { pipe?.close(); }
+    return;
+  }
+
   // 'list' needs no live connection.
   if (cmd === "list") {
     const { threads, activeRoots, rootLabels } = listThreads();
@@ -296,17 +355,16 @@ async function main() {
     }
 
     if (cmd === "send") {
-      const text = args.prompt || args._.slice(1).join(" ");
+      const text = loadPrompt(args);
       if (!text) throw new Error("no prompt text");
-      // Confirmed schema (Codex introspection): message text lives under
-      // params.turnStartParams.input; the owner spreads turnStartParams into
-      // app-server turn/start. Top-level input is discarded.
+      // Version 2 uses turnStart.request and inherits the target settings.
       const params = {
         conversationId,
-        turnStartParams: {
-          input: [{ type: "text", text, text_elements: [] }],
-          clientUserMessageId: randomUUID(),
-          serviceTier: null,
+        turnStart: {
+          request: { threadId: conversationId,
+            input: [{ type: "text", text, text_elements: [] }],
+            clientUserMessageId: randomUUID() },
+          context: { inheritThreadSettings: true },
         },
       };
       const res = await bus.request("thread-follower-start-turn", params, { timeoutMs: 30000 });
