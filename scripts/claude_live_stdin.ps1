@@ -32,7 +32,6 @@ using System.Text;
 using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Threading;
-using System.Text.RegularExpressions;
 
 public static class ClaudeLiveStdinWriter {
   [StructLayout(LayoutKind.Sequential)]
@@ -206,36 +205,40 @@ public static class ClaudeLiveStdinWriter {
     }
   }
 
-  public static string Send(int parentPid, int childPid, string jsonLine) {
-    var standardHandles = ReadChildStandardHandles(childPid);
-    string stdoutName = QueryChildHandleName(childPid, standardHandles["stdout"]);
-    string stderrName = QueryChildHandleName(childPid, standardHandles["stderr"]);
-    var pattern = new Regex(@"\\uv\\(\d+)-" + Regex.Escape(parentPid.ToString()) + "$");
-    var stdoutMatch = pattern.Match(stdoutName);
-    var stderrMatch = pattern.Match(stderrName);
-    if (!stdoutMatch.Success || !stderrMatch.Success) {
-      throw new Exception("Could not infer libuv pipe set. stdout=" + stdoutName + " stderr=" + stderrName);
+  public static int SelectStdinPipe(string stdinName, string[] parentPipeNames) {
+    if (String.IsNullOrWhiteSpace(stdinName) ||
+        !stdinName.StartsWith("\\Device\\NamedPipe\\", StringComparison.OrdinalIgnoreCase) ||
+        stdinName.IndexOf("\\uv\\" + UInt64.MaxValue.ToString() + "-", StringComparison.OrdinalIgnoreCase) >= 0) {
+      throw new Exception("Child stdin has no unambiguous pipe identity; refusing to infer a destination.");
     }
 
-    int stdoutIndex = int.Parse(stdoutMatch.Groups[1].Value);
-    int stderrIndex = int.Parse(stderrMatch.Groups[1].Value);
-    int stdinIndex = Math.Min(stdoutIndex, stderrIndex) - 1;
+    int selected = -1;
+    for (int i = 0; i < parentPipeNames.Length; i++) {
+      if (!String.Equals(stdinName, parentPipeNames[i], StringComparison.OrdinalIgnoreCase)) continue;
+      if (selected >= 0) throw new Exception("Multiple parent pipes match child stdin; refusing to send.");
+      selected = i;
+    }
+    if (selected < 0) throw new Exception("No parent pipe matches the actual child stdin; refusing to send.");
+    return selected;
+  }
 
-    var targetSuffixes = new List<string>();
-    if (stdinIndex >= 0) targetSuffixes.Add("\\uv\\" + stdinIndex + "-" + parentPid);
-    // Recent Claude/Electron builds can expose the app-owned stdin pipe with the libuv
-    // underflow sentinel instead of the adjacent stdout/stderr index.
-    string underflowSuffix = "\\uv\\" + UInt64.MaxValue.ToString() + "-" + parentPid;
-    if (!targetSuffixes.Contains(underflowSuffix)) targetSuffixes.Add(underflowSuffix);
+  public static string Send(int parentPid, int childPid, string jsonLine) {
+    var standardHandles = ReadChildStandardHandles(childPid);
+    string stdinName = QueryChildHandleName(childPid, standardHandles["stdin"]);
+    // Reject shared sentinel names before opening any writable parent pipe.
+    SelectStdinPipe(stdinName, new string[] { stdinName });
 
     var handles = QueryHandles();
     IntPtr parent = OpenProcess(PROCESS_DUP_HANDLE, false, parentPid);
     if (parent == IntPtr.Zero) throw new Exception("OpenProcess parent failed: " + Marshal.GetLastWin32Error());
 
+    var parentPipes = new List<IntPtr>();
+    var parentPipeNames = new List<string>();
+    var parentHandleValues = new List<ulong>();
     try {
-      var observedParentPipes = new List<string>();
       foreach (var entry in handles) {
         if (entry.UniqueProcessId.ToUInt64() != (ulong)parentPid) continue;
+        if ((entry.GrantedAccess & 0x00000002) == 0) continue;
         ulong handleValue = entry.HandleValue.ToUInt64();
         IntPtr duplicate;
         if (!DuplicateHandle(parent, new IntPtr(unchecked((long)handleValue)), GetCurrentProcess(), out duplicate, 0, false, DUPLICATE_SAME_ACCESS)) {
@@ -244,39 +247,28 @@ public static class ClaudeLiveStdinWriter {
         try {
           if (GetFileType(duplicate) != FILE_TYPE_PIPE) continue;
           string name = QueryNameWithTimeout(duplicate, 150);
-          if (name.Contains("\\uv\\")) observedParentPipes.Add(name);
-
-          string matchedSuffix = null;
-          foreach (var targetSuffix in targetSuffixes) {
-            if (name.EndsWith(targetSuffix, StringComparison.OrdinalIgnoreCase)) {
-              matchedSuffix = targetSuffix;
-              break;
-            }
-          }
-          if (matchedSuffix == null) continue;
-
-          byte[] bytes = Encoding.UTF8.GetBytes(jsonLine + "\n");
-          uint written;
-          bool ok = WriteFile(duplicate, bytes, (uint)bytes.Length, out written, IntPtr.Zero);
-          int error = Marshal.GetLastWin32Error();
-          return "{\"ok\":" + (ok ? "true" : "false") +
-            ",\"target\":\"" + EscapeJson(name) +
-            "\",\"candidate\":\"" + EscapeJson(matchedSuffix) +
-            "\",\"parentHandle\":\"0x" + handleValue.ToString("X") +
-            "\",\"stdout\":\"" + EscapeJson(stdoutName) +
-            "\",\"stderr\":\"" + EscapeJson(stderrName) +
-            "\",\"bytes\":" + bytes.Length +
-            ",\"written\":" + written +
-            ",\"error\":" + error + "}";
+          if (!String.Equals(name, stdinName, StringComparison.OrdinalIgnoreCase)) continue;
+          parentPipes.Add(duplicate);
+          parentPipeNames.Add(name);
+          parentHandleValues.Add(handleValue);
+          duplicate = IntPtr.Zero;
         } finally {
-          CloseHandle(duplicate);
+          if (duplicate != IntPtr.Zero) CloseHandle(duplicate);
         }
       }
-      throw new Exception("Parent stdin pipe not found: suffixes=" + String.Join(",", targetSuffixes) +
-        " stdout=" + stdoutName +
-        " stderr=" + stderrName +
-        " parentPipes=" + String.Join(",", observedParentPipes));
+      int selected = SelectStdinPipe(stdinName, parentPipeNames.ToArray());
+      byte[] bytes = Encoding.UTF8.GetBytes(jsonLine + "\n");
+      uint written;
+      bool ok = WriteFile(parentPipes[selected], bytes, (uint)bytes.Length, out written, IntPtr.Zero);
+      int error = Marshal.GetLastWin32Error();
+      return "{\"ok\":" + (ok && written == bytes.Length ? "true" : "false") +
+        ",\"target\":\"" + EscapeJson(stdinName) +
+        "\",\"parentHandle\":\"0x" + parentHandleValues[selected].ToString("X") +
+        "\",\"bytes\":" + bytes.Length +
+        ",\"written\":" + written +
+        ",\"error\":" + error + "}";
     } finally {
+      foreach (var pipe in parentPipes) CloseHandle(pipe);
       CloseHandle(parent);
     }
   }

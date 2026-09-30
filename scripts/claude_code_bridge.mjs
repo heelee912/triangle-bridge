@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, peerReceipt, probePeer, sendPeer, waitForPeerReceipt } from "./claude_peer_transport.mjs";
 
 const CODE_MODEL = "claude-opus-4-8";
 const CODE_EFFORT = "xhigh";
@@ -19,9 +20,23 @@ const DEFAULT_MAIN_INSPECT_PORT = 9229;
 const POLL_INTERVAL_MS = 2000;
 
 const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-const claudeDataDir = path.join(appData, "Claude");
-const codeSessionRoot = path.join(claudeDataDir, "claude-code-sessions");
-const coworkSessionRoot = path.join(claudeDataDir, "local-agent-mode-sessions");
+const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+const conventionalClaudeDataDir = path.join(appData, "Claude");
+const packageRoot = path.join(localAppData, "Packages");
+const packageClaudeDataDirs = (() => {
+  try {
+    return fs
+      .readdirSync(packageRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.toLowerCase().startsWith("claude_"))
+      .map((entry) => path.join(packageRoot, entry.name, "LocalCache", "Roaming", "Claude"));
+  } catch {
+    return [];
+  }
+})();
+const claudeDataDirs = [...new Set([conventionalClaudeDataDir, ...packageClaudeDataDirs])];
+const claudeDataDir = claudeDataDirs.find((candidate) => fs.existsSync(candidate)) || conventionalClaudeDataDir;
+const codeSessionRoots = claudeDataDirs.map((candidate) => path.join(candidate, "claude-code-sessions"));
+const coworkSessionRoots = claudeDataDirs.map((candidate) => path.join(candidate, "local-agent-mode-sessions"));
 const developerSettingsPath = path.join(claudeDataDir, "developer_settings.json");
 const transcriptRoot = path.join(os.homedir(), ".claude", "projects");
 const claudeCodeCredentialsPath = path.join(os.homedir(), ".claude", ".credentials.json");
@@ -97,7 +112,9 @@ function usage() {
   claude_code_bridge.mjs status [--cwd PATH] [--json]
   claude_code_bridge.mjs list [--cwd PATH] [--json]
   claude_code_bridge.mjs code start --prompt TEXT [--cwd PATH] [--title TEXT] [--wait]
-  claude_code_bridge.mjs code send --prompt TEXT [--cwd PATH] [--session-id local_...] [--wait] [--transport auto|renderer|raw|live-stdin|cli]
+  claude_code_bridge.mjs code send --prompt TEXT --session-id ID [--cwd PATH] [--wait] [--transport auto|renderer|raw|peer|live-stdin|cli]
+  claude_code_bridge.mjs code peer-probe --session-id ID [--cwd PATH] [--json]
+  claude_code_bridge.mjs code peer-receipt --session-id ID --message-id UUID [--json]
   claude_code_bridge.mjs cowork start --prompt TEXT [--cwd PATH] [--title TEXT] [--wait]
   claude_code_bridge.mjs cowork send --prompt TEXT [--session-id local_...] [--wait]
   claude_code_bridge.mjs read [--surface code|cowork] [--cwd PATH] [--session-id local_...] [--lines N] [--json]
@@ -120,6 +137,7 @@ Renderer transport:
 
 Bridge bootstrap:
   Mutating commands first try existing transports, then non-destructive attach attempts.
+  --attach-only prevents bootstrap from launching another Claude Desktop instance.
   Use --restart-claude --yes to let the CLI restart Claude Desktop with --inspect.
 
 Raw IPC transport:
@@ -128,6 +146,9 @@ Raw IPC transport:
 
 Code CLI resume transport:
   --transport live-stdin                Send into Claude Desktop's already-running claude-code child stdin pipe.
+  --transport peer                      Use Claude's authenticated session-specific inbox. No OAuth sync or restart.
+  --sender-mode bypass|prompting         Required for peer. Actual sender permissions for Claude's parity check.
+  --sender-session-id ID                 Required for peer. Identifies the sending session.
   --transport cli                       Send through claude.exe --resume when Desktop bridges are unavailable.
   --no-auth-sync                        Do not sync Claude Code OAuth credentials from Claude Desktop.
   --cli-timeout-ms N                    Foreground CLI wait timeout. Default: ${DEFAULT_CLI_TIMEOUT_MS}.
@@ -201,6 +222,21 @@ function walkFiles(root, predicate, maxFiles = 10000) {
   return out;
 }
 
+function walkFilesFromRoots(roots, predicate, maxFiles = 10000) {
+  const out = [];
+  const seen = new Set();
+  for (const root of roots) {
+    for (const filePath of walkFiles(root, predicate, maxFiles - out.length)) {
+      const key = normalizeFilePath(filePath);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(filePath);
+      if (out.length >= maxFiles) return out;
+    }
+  }
+  return out;
+}
+
 function mtimeMs(filePath) {
   return safeStat(filePath)?.mtimeMs || 0;
 }
@@ -252,8 +288,8 @@ function summarizeCoworkSession(filePath) {
 
 function listCodeSessions({ cwd } = {}) {
   const normalizedCwd = cwd ? normalizeFilePath(cwd) : "";
-  const files = walkFiles(
-    codeSessionRoot,
+  const files = walkFilesFromRoots(
+    codeSessionRoots,
     (filePath) => path.basename(filePath).startsWith("local_") && filePath.endsWith(".json"),
   );
   return files
@@ -274,8 +310,8 @@ function listCodeSessions({ cwd } = {}) {
 
 function listCoworkSessions({ cwd } = {}) {
   const normalizedCwd = cwd ? normalizeFilePath(cwd) : "";
-  const files = walkFiles(
-    coworkSessionRoot,
+  const files = walkFilesFromRoots(
+    coworkSessionRoots,
     (filePath) => path.basename(filePath).startsWith("local_") && filePath.endsWith(".json"),
   );
   return files
@@ -304,13 +340,9 @@ function resolveSession(surface, args) {
   const sessions = listSessions(surface, { cwd });
   const sessionId = args["session-id"] || args.sessionId;
   if (sessionId) {
-    const exact = sessions.find((session) => session.sessionId === sessionId);
-    if (exact) return exact;
-
-    const allSessions = listSessions(surface);
-    const globalExact = allSessions.find((session) => session.sessionId === sessionId);
-    if (globalExact) return globalExact;
-    throw new CliError(`session not found: ${sessionId}`);
+    const exact = findSessionById(listSessions(surface), sessionId);
+    if (cwd && normalizeFilePath(exact.cwd) !== normalizeFilePath(cwd)) throw new CliError("Explicit Claude session does not match --cwd");
+    return exact;
   }
   if (!sessions.length) {
     throw new CliError(`no ${surface} sessions found${cwd ? ` for cwd ${cwd}` : ""}`);
@@ -320,7 +352,14 @@ function resolveSession(surface, args) {
 
 function codeTranscriptPath(session) {
   if (!session.cwd || !session.cliSessionId) return null;
-  return path.join(transcriptRoot, encodeProjectPath(session.cwd), `${session.cliSessionId}.jsonl`);
+  const expected = path.join(transcriptRoot, encodeProjectPath(session.cwd), `${session.cliSessionId}.jsonl`);
+  if (safeStat(expected)) return expected;
+  const matches = walkFiles(
+    transcriptRoot,
+    (filePath) => path.basename(filePath) === `${session.cliSessionId}.jsonl`,
+    10000,
+  ).sort((a, b) => mtimeMs(b) - mtimeMs(a));
+  return matches[0] || expected;
 }
 
 function readJsonl(filePath) {
@@ -550,7 +589,7 @@ function listClaudeProcesses() {
 $ErrorActionPreference = 'SilentlyContinue'
 Get-CimInstance Win32_Process |
   Where-Object { $_.Name -like '*Claude*' -or $_.ExecutablePath -like '*Claude*' -or $_.CommandLine -like '*claude-code*' } |
-  Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine |
+  Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate |
   ConvertTo-Json -Compress -Depth 4
 `;
   try {
@@ -571,11 +610,40 @@ function lower(value) {
   return String(value || "").toLowerCase();
 }
 
+function processCreationDateMs(proc) {
+  const raw = proc?.CreationDate || proc?.creationDate;
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+
+  const text = String(raw);
+  const dotNetDate = text.match(/\/Date\((-?\d+)\)\//);
+  if (dotNetDate) return Number.parseInt(dotNetDate[1], 10);
+
+  const cimDate = text.match(/^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.(\d+)/);
+  if (cimDate) {
+    const [, year, month, day, hour, minute, second, fraction] = cimDate;
+    const ms = Number.parseInt(fraction.slice(0, 3).padEnd(3, "0"), 10);
+    return new Date(
+      Number.parseInt(year, 10),
+      Number.parseInt(month, 10) - 1,
+      Number.parseInt(day, 10),
+      Number.parseInt(hour, 10),
+      Number.parseInt(minute, 10),
+      Number.parseInt(second, 10),
+      ms,
+    ).getTime();
+  }
+
+  const parsed = Date.parse(text);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function isClaudeDesktopProcess(proc) {
   const exe = lower(proc.ExecutablePath || proc.executablePath);
   const cmd = lower(proc.CommandLine || proc.commandLine);
   if (!exe.endsWith("\\claude.exe")) return false;
   if (exe.includes("\\appdata\\roaming\\claude\\claude-code\\")) return false;
+  if (exe.includes("\\localcache\\roaming\\claude\\claude-code\\")) return false;
   if (!exe.includes("\\windowsapps\\claude_") && !cmd.includes("\\resources\\app.asar")) return false;
   return true;
 }
@@ -618,22 +686,28 @@ function findClaudeDesktopExecutable() {
 
 function isClaudeCodeCliProcess(proc) {
   const exe = lower(proc.ExecutablePath || proc.executablePath);
-  return exe.endsWith("\\claude.exe") && exe.includes("\\appdata\\roaming\\claude\\claude-code\\");
+  return (
+    exe.endsWith("\\claude.exe") &&
+    (exe.includes("\\appdata\\roaming\\claude\\claude-code\\") ||
+      exe.includes("\\localcache\\roaming\\claude\\claude-code\\"))
+  );
 }
 
 function listClaudeCodeCliProcesses() {
   return listClaudeProcesses().filter(isClaudeCodeCliProcess);
 }
 
-function findLiveClaudeCodeProcessForSession(session) {
+function findLiveClaudeCodeProcessForSession(session, processes = listClaudeCodeCliProcesses()) {
   if (!session?.cliSessionId) return null;
   const cliSessionId = lower(session.cliSessionId);
-  return (
-    listClaudeCodeCliProcesses().find((proc) => {
-      const commandLine = lower(proc.CommandLine || proc.commandLine);
-      return commandLine.includes(`--resume ${cliSessionId}`) || commandLine.includes(`--resume=${cliSessionId}`);
-    }) || null
-  );
+  const matches = processes.filter((proc) => {
+    const commandLine = lower(proc.CommandLine || proc.commandLine);
+    const identifiers = [...commandLine.matchAll(/(?:^|\s)--(?:resume|session-id)(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s]+))/g)]
+      .map((match) => match[1] ?? match[2] ?? match[3]);
+    return identifiers.length > 0 && identifiers.every((identifier) => identifier === cliSessionId);
+  });
+  // Creation time and model settings do not establish session identity.
+  return matches.length === 1 ? matches[0] : null;
 }
 
 function findDesktopParentPidForCodeProcess(proc) {
@@ -858,6 +932,7 @@ function tryDebugExistingMainProcess(proc) {
 }
 
 function discoverClaudeListenPorts() {
+  if (process.env.CLAUDE_BRIDGE_ENABLE_NETTCP_DISCOVERY !== "1") return [];
   if (process.platform !== "win32") return [];
   const command = `
 $ErrorActionPreference = 'SilentlyContinue'
@@ -1677,7 +1752,7 @@ async function bootstrapRawIpcBridge(args, surface, options = {}) {
     }
   }
 
-  if (mainProcess) {
+  if (mainProcess && !toBool(args["attach-only"])) {
     try {
       const launch = launchClaudeDesktopWithInspector(port);
       steps.push({ action: "second-instance-inspect-launch", ok: true, ...launch });
@@ -1688,7 +1763,7 @@ async function bootstrapRawIpcBridge(args, surface, options = {}) {
     } catch (error) {
       steps.push({ action: "second-instance-inspect-launch", ok: false, reason: String(error.message || error) });
     }
-  } else {
+  } else if (!mainProcess && !toBool(args["attach-only"])) {
     try {
       const launch = launchClaudeDesktopWithInspector(port);
       steps.push({ action: "launch-with-main-inspector", ok: true, ...launch });
@@ -1763,7 +1838,7 @@ async function bootstrapRendererBridge(args, surface, options = {}) {
     }
   }
 
-  if (mainProcess) {
+  if (mainProcess && !toBool(args["attach-only"])) {
     try {
       const launch = launchClaudeDesktopWithInspector(port);
       steps.push({ action: "second-instance-inspect-launch", ok: true, ...launch });
@@ -1774,7 +1849,7 @@ async function bootstrapRendererBridge(args, surface, options = {}) {
     } catch (error) {
       steps.push({ action: "second-instance-inspect-launch", ok: false, reason: String(error.message || error) });
     }
-  } else {
+  } else if (!mainProcess && !toBool(args["attach-only"])) {
     try {
       const launch = launchClaudeDesktopWithInspector(port);
       steps.push({ action: "launch-with-main-inspector", ok: true, ...launch });
@@ -1989,8 +2064,16 @@ function sendTransportMode(args) {
   if (requested === "raw-ipc") return "raw";
   if (requested === "claude-code" || requested === "claude-code-cli" || requested === "cli-resume") return "cli";
   if (requested === "live" || requested === "stdin" || requested === "live-stdin") return "live-stdin";
-  if (["auto", "renderer", "raw", "live-stdin", "cli"].includes(requested)) return requested;
+  if (["auto", "renderer", "raw", "peer", "live-stdin", "cli"].includes(requested)) return requested;
   throw new CliError(`unknown transport: ${requested}`);
+}
+
+function cliFallbackAllowed(args) {
+  return (
+    toBool(args["allow-cli-fallback"]) ||
+    toBool(args.allowCliFallback) ||
+    process.env.CLAUDE_BRIDGE_ALLOW_CLI_FALLBACK === "1"
+  );
 }
 
 async function chooseSendTransport(args, surface, session = null) {
@@ -2004,9 +2087,15 @@ async function chooseSendTransport(args, surface, session = null) {
   const raw = await createMainInspectorClient(probeArgs, surface);
   if (raw.available) return "raw";
 
+  if (surface === "code" && session) {
+    try { findPeerRuntime(session, listClaudeCodeCliProcesses()); return "peer"; } catch { /* Continue only to ID-bound transports. */ }
+  }
   if (surface === "code" && session && findLiveClaudeCodeProcessForSession(session)) return "live-stdin";
 
-  if (surface === "code") return "cli";
+  if (surface === "code") {
+    if (cliFallbackAllowed(args)) return "cli";
+    throw new CliError("No app-owned Claude Desktop transport is available; CLI fallback is disabled by default. Pass --allow-cli-fallback only when the user explicitly approves CLI resume.");
+  }
   return "renderer";
 }
 
@@ -2289,6 +2378,46 @@ async function codeLiveStdinAction(_args, surface, session, prompt) {
   };
 }
 
+async function codePeerAction(args, surface, session, prompt) {
+  if (surface !== "code") throw new CliError("peer transport only supports Code sessions");
+  const runtime = findPeerRuntime(session, listClaudeCodeCliProcesses());
+  const transcriptPath = codeTranscriptPath(session);
+  let offset = 0;
+  try { offset = fs.statSync(transcriptPath).size; } catch (error) { if (error.code !== "ENOENT") throw error; }
+  const result = await sendPeer(runtime, prompt, {
+    senderMode: args["sender-mode"],
+    senderSessionId: args["sender-session-id"],
+  });
+  if (toBool(args.wait)) {
+    try {
+      Object.assign(result, await waitForPeerReceipt(transcriptPath, runtime, result.messageId, toInt(args["timeout-ms"], DEFAULT_WAIT_TIMEOUT_MS), offset));
+      await markPeerMessage(result.outboxPath, result.messageId, "confirmed");
+    } catch (error) {
+      error.details ||= { delivery: "unknown", messageId: result.messageId, sessionId: runtime.sessionId };
+      try { await markPeerMessage(result.outboxPath, result.messageId, error.details.delivery); }
+      catch { error.details.outboxUpdateFailed = true; }
+      throw error;
+    }
+  }
+  return { bridge: { transport: { kind: "claude-session-peer", ...runtime } }, result };
+}
+
+async function cmdPeerProbe(args, surface) {
+  if (surface !== "code" || !(args["session-id"] || args.sessionId)) throw new CliError("Code peer-probe requires an explicit --session-id");
+  const session = resolveSession(surface, args);
+  const runtime = findPeerRuntime(session, listClaudeCodeCliProcesses());
+  printJson({ ok: true, sessionId: session.sessionId, cliSessionId: session.cliSessionId, runtime, result: probePeer(runtime) });
+}
+
+async function cmdPeerReceipt(args, surface) {
+  if (surface !== "code" || !(args["session-id"] || args.sessionId) || !args["message-id"]) throw new CliError("Code peer-receipt requires --session-id and --message-id");
+  const session = resolveSession(surface, args);
+  const record = findPeerMessageRecord(session.cliSessionId, args["message-id"]);
+  const receipt = peerReceipt(createTranscriptTail(codeTranscriptPath(session))(), session.cliSessionId, record.messageId);
+  if (receipt?.userMessageObserved) await markPeerMessage(record.recordPath, record.messageId, "confirmed");
+  printJson({ ok: true, sessionId: session.cliSessionId, messageId: record.messageId, outboxPath: record.recordPath, delivery: receipt ? (receipt.assistantReplyObserved ? "transcript-confirmed" : "transcript-confirmed-awaiting-reply") : "unknown", receipt });
+}
+
 async function sessionAction(args, surface, payload) {
   if (toBool(args["raw-ipc"]) || toBool(args.rawIpc)) {
     return rawIpcAction(args, surface, payload);
@@ -2407,6 +2536,10 @@ async function cmdStatus(args, surface) {
       code: codeSessions,
       cowork: coworkSessions,
     },
+    peerIpc: codeSessions.map((session) => {
+      try { return { registered: true, serverVerified: false, ...findPeerRuntime(session, listClaudeCodeCliProcesses()) }; }
+      catch (error) { return { registered: false, sessionId: session.cliSessionId, reason: error.message }; }
+    }),
     processes: listClaudeProcesses(),
     desktopProcesses: listClaudeDesktopProcesses(),
     desktopMainProcesses: listClaudeDesktopMainProcesses(),
@@ -2492,7 +2625,8 @@ async function cmdAuthSync(args) {
 async function cmdRaw(args, surface, rest) {
   const subcommand = String(rest[0] || "probe").toLowerCase();
   if (subcommand === "probe" || subcommand === "status") {
-    const boot = toBool(args["no-bootstrap"])
+    const shouldBootstrap = toBool(args.bootstrap) || toBool(args["allow-bootstrap"]) || toBool(args.allowBootstrap);
+    const boot = toBool(args["no-bootstrap"]) || !shouldBootstrap
       ? { ok: false, client: await createMainInspectorClient(args, surface), steps: [] }
       : await bootstrapRawIpcBridge(args, surface);
     const client = boot.client || (boot.ok === false && boot.client) || null;
@@ -2610,8 +2744,9 @@ async function cmdStart(args, surface, rest) {
 }
 
 async function cmdSend(args, surface, rest) {
-  const prompt = readPrompt(args, rest).trim();
-  if (!prompt) throw new CliError("send requires --prompt TEXT, --prompt-file PATH, or positional text");
+  if (!(args["session-id"] || args.sessionId)) throw new CliError("send requires an explicit --session-id; newest or focused sessions are never inferred");
+  const prompt = readPrompt(args, rest);
+  if (!prompt.trim()) throw new CliError("send requires --prompt TEXT, --prompt-file PATH, or positional text");
   const session = resolveSession(surface, args);
   const before = (() => {
     try {
@@ -2634,6 +2769,8 @@ async function cmdSend(args, surface, rest) {
   const { bridge, result } =
     chosenTransport === "cli"
       ? await codeCliResumeAction(args, surface, session, prompt, before)
+      : chosenTransport === "peer"
+        ? await codePeerAction(args, surface, session, prompt)
       : chosenTransport === "live-stdin"
         ? await codeLiveStdinAction(args, surface, session, prompt)
       : await sessionAction(actionArgs, surface, {
@@ -2650,12 +2787,12 @@ async function cmdSend(args, surface, rest) {
     surface,
     sessionId: session.sessionId,
     transport: chosenTransport,
-    defaults: defaultsForSurface(surface),
+    defaults: chosenTransport === "peer" ? null : defaultsForSurface(surface),
     bridge: bridge.transport,
     result,
   };
 
-  if (toBool(args.wait)) {
+  if (toBool(args.wait) && chosenTransport !== "peer") {
     output.transcript = await waitForAssistantReply(surface, args, before);
   }
 
@@ -2706,6 +2843,32 @@ async function cmdWait(args, surface) {
 }
 
 async function cmdSelftest() {
+  const initialSession = {
+    cliSessionId: "target-session",
+    createdAt: Date.parse("2026-09-30T16:03:38.634Z"),
+    model: "claude-opus-5-5",
+    effort: "high",
+    permissionMode: "bypassPermissions",
+  };
+  const initialChild = {
+    ProcessId: 123,
+    CreationDate: "2026-09-30T16:03:22.499Z",
+    CommandLine: "claude.exe --input-format stream-json --output-format stream-json --model claude-opus-5-5 --effort high --permission-mode acceptEdits",
+  };
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [initialChild]) === null, "initial child without a session ID is never inferred from creation time");
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [{ ...initialChild, CreationDate: "2026-09-30T15:00:00Z" }]) === null, "unrelated older initial child rejected");
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [initialChild, { ...initialChild, ProcessId: 124 }]) === null, "ambiguous initial children rejected");
+  assert(findLiveClaudeCodeProcessForSession({ ...initialSession, createdAt: null }, [initialChild]) === null, "initial child needs a session creation anchor");
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [{ ...initialChild, CommandLine: `${initialChild.CommandLine} --resume=other-session` }]) === null, "another resumed session rejected");
+  const resumedChild = { ...initialChild, CommandLine: `${initialChild.CommandLine} --resume=target-session` };
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [resumedChild]) === resumedChild, "exact resumed session remains supported");
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [{ ...resumedChild, CommandLine: `${initialChild.CommandLine} --resume target-session-extra` }]) === null, "session ID prefix rejected");
+  const quotedChild = { ...initialChild, CommandLine: `${initialChild.CommandLine} --resume "target-session"` };
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [quotedChild]) === quotedChild, "quoted exact resume ID accepted");
+  const identifiedChild = { ...initialChild, CommandLine: `${initialChild.CommandLine} --session-id=target-session` };
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [identifiedChild]) === identifiedChild, "explicit initial session ID accepted");
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [resumedChild, { ...resumedChild, ProcessId: 124 }]) === null, "duplicate exact-session children rejected");
+  assert(findLiveClaudeCodeProcessForSession(initialSession, [{ ...resumedChild, CommandLine: `${resumedChild.CommandLine} --session-id=other-session` }]) === null, "conflicting session IDs rejected");
   const cwd = "C:\\Users\\USER\\Desktop\\Projects\\SEMI";
   const prompt = "hello";
   const codeStart = buildStartPayload("code", { cwd, title: "t" }, prompt);
@@ -2795,6 +2958,12 @@ async function main() {
       return;
     case "send":
       await cmdSend(args, surface, rest);
+      return;
+    case "peer-probe":
+      await cmdPeerProbe(args, surface);
+      return;
+    case "peer-receipt":
+      await cmdPeerReceipt(args, surface);
       return;
     case "read":
       await cmdRead(args, surface);

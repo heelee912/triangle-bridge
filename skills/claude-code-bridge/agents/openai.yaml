@@ -1,0 +1,7 @@
+interface:
+  display_name: "Claude Codex Bridge"
+  short_description: "Exchange messages with exact Claude and Codex sessions"
+  default_prompt: "Use $claude-code-bridge to communicate with the specified Claude or Codex session and confirm the reply."
+
+policy:
+  allow_implicit_invocation: true
