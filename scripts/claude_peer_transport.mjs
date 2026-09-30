@@ -197,14 +197,25 @@ export async function sendPeer(runtime, prompt, options = {}) {
   }
 }
 
+function isQueuedPrompt(entry) {
+  return entry.type === "attachment" && entry.attachment?.type === "queued_command" && entry.attachment.commandMode === "prompt";
+}
+
 export function peerReceipt(entries, sessionId, messageId) {
-  const index = entries.findIndex((entry) => entry.type === "user" && entry.uuid === messageId && entry.sessionId === sessionId);
+  const index = entries.findIndex((entry) => {
+    if (entry.sessionId !== sessionId || typeof entry.uuid !== "string" || !entry.uuid) return false;
+    if (entry.type === "user") return entry.uuid === messageId;
+    const queued = entry.attachment;
+    return isQueuedPrompt(entry) && queued.source_uuid === messageId && queued.origin?.kind === "peer" && queued.origin.msg_id === messageId;
+  });
   if (index < 0) return null;
-  const descendants = new Set([messageId]);
+  // Busy sessions store the request ID inside an attachment with its own UUID.
+  const descendants = new Set([entries[index].uuid]);
   const replies = [];
   for (const entry of entries.slice(index + 1)) {
     if (entry.sessionId !== sessionId || !descendants.has(entry.parentUuid)) continue;
     const toolResult = Array.isArray(entry.message?.content) && entry.message.content.some((block) => block.type === "tool_result");
+    if (isQueuedPrompt(entry)) break;
     if (entry.type === "user" && !toolResult && (!entry.isMeta || entry.origin?.kind === "peer")) break;
     if (entry.uuid) descendants.add(entry.uuid);
     if (entry.type === "assistant") replies.push(entry);

@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildPeerFrame, createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, parsePeerHelperReply, peerReceipt, reservePeerMessage, validatePeerKey, withPeerOutboxLock } from "./claude_peer_transport.mjs";
+import { buildPeerFrame, createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, parsePeerHelperReply, peerReceipt, reservePeerMessage, validatePeerKey, waitForPeerReceipt, withPeerOutboxLock } from "./claude_peer_transport.mjs";
 
 const session = { cliSessionId: "target", cwd: "C:\\Projects\\YomiLayer" };
 const runtime = { pid: 42, sessionId: "target", cwd: session.cwd, procStart: "123456789", entrypoint: "claude-desktop", peerProtocol: 1, messagingSocketPath: "\\\\.\\pipe\\LOCAL\\cc-msg-" + "a".repeat(32) };
@@ -194,4 +194,63 @@ test("receipt distinguishes received message from subsequent reply", () => {
   assert.equal(peerReceipt(entries, "target", "request-1").assistantReplyObserved, false);
   entries.push({ type: "assistant", sessionId: "target", parentUuid: "request-1", message: { content: [{ type: "text", text: "received" }] } });
   assert.equal(peerReceipt(entries, "target", "request-1").assistantText, "received");
+});
+
+// Anonymized shape of a peer prompt received while Claude was already working.
+const queuedPeerRequest = {
+  type: "attachment", sessionId: "target", uuid: "attachment-1", parentUuid: "prior-work",
+  attachment: {
+    type: "queued_command", source_uuid: "request-1", commandMode: "prompt", isMeta: true,
+    origin: { kind: "peer", msg_id: "request-1", fromSession: "sender" },
+    prompt: "anonymized peer prompt",
+  },
+};
+
+test("queued peer receipt follows the attachment UUID rather than the request UUID", () => {
+  const entries = [queuedPeerRequest];
+  assert.equal(peerReceipt(entries, "target", "request-1")?.userMessageObserved, true);
+  assert.equal(peerReceipt(entries, "target", "request-1").assistantReplyObserved, false);
+  entries.push(
+    { type: "queue-operation", sessionId: "target" },
+    { type: "attachment", sessionId: "target", uuid: "metadata", parentUuid: "attachment-1", attachment: { type: "other" } },
+    { type: "assistant", sessionId: "target", uuid: "reply-1", parentUuid: "metadata", message: { content: [{ type: "text", text: "received queued request" }] } },
+  );
+  assert.equal(peerReceipt(entries, "target", "request-1").assistantText, "received queued request");
+});
+
+test("queued peer receipt requires matching session, source UUID and peer origin", () => {
+  const attachment = queuedPeerRequest.attachment;
+  for (const entry of [
+    { ...queuedPeerRequest, sessionId: "other" },
+    { ...queuedPeerRequest, type: "user" },
+    { ...queuedPeerRequest, uuid: undefined },
+    { ...queuedPeerRequest, attachment: { ...attachment, source_uuid: "other" } },
+    { ...queuedPeerRequest, attachment: { ...attachment, commandMode: "other" } },
+    { ...queuedPeerRequest, attachment: { ...attachment, origin: { kind: "peer", msg_id: "other" } } },
+    { ...queuedPeerRequest, attachment: { ...attachment, origin: { kind: "other", msg_id: "request-1" } } },
+  ]) {
+    assert.equal(peerReceipt([entry], "target", "request-1"), null);
+  }
+});
+
+test("a later queued peer request cannot contaminate either receipt format", () => {
+  for (const request of [queuedPeerRequest, { type: "user", sessionId: "target", uuid: "request-1" }]) {
+    const next = {
+      ...queuedPeerRequest, uuid: "attachment-2", parentUuid: request.uuid,
+      attachment: { ...queuedPeerRequest.attachment, source_uuid: "request-2", origin: { kind: "peer", msg_id: "request-2" } },
+    };
+    const later = { type: "assistant", sessionId: "target", parentUuid: next.uuid, message: { content: [{ type: "text", text: "reply to next request" }] } };
+    assert.equal(peerReceipt([request, next, later], "target", "request-1").assistantReplyObserved, false);
+  }
+});
+
+test("receipt wait confirms a saved queued fixture without sending a message", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "claude-peer-queued-test-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, "transcript.jsonl");
+  const reply = { type: "assistant", sessionId: "target", parentUuid: "attachment-1", message: { content: [{ type: "text", text: "queued fixture reply" }] } };
+  fs.writeFileSync(file, [queuedPeerRequest, reply].map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+  const receipt = await waitForPeerReceipt(file, runtime, "request-1", 1000);
+  assert.equal(receipt.delivery, "transcript-confirmed");
+  assert.equal(receipt.assistantText, "queued fixture reply");
 });
