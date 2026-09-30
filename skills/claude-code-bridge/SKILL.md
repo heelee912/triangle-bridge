@@ -1,6 +1,6 @@
 ---
 name: claude-code-bridge
-description: Exchange messages between Claude Desktop and Codex using the user's local bidirectional bridge. Use for Claude collaboration, session-specific prompts and replies, bridge troubleshooting, or reading an explicitly selected session. No browser or UI relay.
+description: Exchange messages between Claude Desktop and Codex using the user's local bidirectional bridge. Use for Claude collaboration, supported session creation, session-specific prompts and replies, bridge troubleshooting, or reading an explicitly selected session. No browser or UI relay.
 ---
 
 # Claude Code Bridge
@@ -33,6 +33,22 @@ node $codex send --thread TARGET_CODEX_ID --prompt-file "C:\Temp\reply.md"
 Peer sends require both sender options. The outbox stores request IDs and states under `%USERPROFILE%\.claude-codex-bridge\peer-outbox`, not prompt text or account credentials. A duplicate unconfirmed prompt to the same recipient is refused even from another bridge process. Use `code peer-receipt --session-id ID --message-id UUID` to reconcile a delayed receipt or a send without `--wait`. It updates the outbox only when the exact request appears in that target's transcript. Confirmed requests can be sent again as an intentional new turn. Windows outbox locking uses an exclusive live named pipe, which the OS releases after a process crash; it does not leave persistent `.lock` files.
 
 Pipe writes and an assistant's initial text are not completion of the assigned work. Confirm the matching target transcript and final response or return message. `codex_bridge.mjs` returning `app-acknowledged` confirms app acceptance; read the destination for actual receipt and completion.
+
+## Starting A New Claude Code Session
+
+Use `code start` when the live `LocalSessions` API is available. If it is unavailable, an explicitly authorized existing Claude session can use its native `mcp__ccd_session__spawn_task` tool:
+
+```json
+{"title":"Short session title","tldr":"Purpose of the new session","prompt":"Initial instruction","cwd":"C:\\path\\to\\project"}
+```
+
+Ask that exact Claude session through the peer transport to inspect its available tools and call `spawn_task` once. The returned `task_id` identifies a suggestion card, not a running session. The user must start the card. Do not duplicate it or activate a debugger or restart the app as an implicit fallback.
+
+After the user starts it, Claude can use `list_sessions`, `get_session` and `list_events` under `mcp__ccd_session_mgmt__` to return the actual Desktop session ID, working directory and first reply. Git projects may start in a new worktree. A verified non-Git project opened in its original folder. Always verify the actual directory instead of promising either behavior.
+
+Resolve the new CLI session ID from local metadata and the live runtime registry. Run `code peer-probe --session-id ID` and read its first response before handing it to the assigned collaborator. Preserve the created model and permissions unless the user requests changes.
+
+A destination missing from local `codex_bridge status` is not proof that its ID is invalid. Check it with the available Codex app `read_thread` tool. A cloud-backed destination may require its authorized local coordinator to relay messages. Do not substitute an unrelated session.
 
 ## Scope
 
