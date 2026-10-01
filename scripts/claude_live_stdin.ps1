@@ -3,12 +3,16 @@ param(
   [Parameter(Mandatory = $true)][int]$ChildPid,
   [string]$JsonLine,
   [string]$JsonLineBase64,
-  [switch]$StdinBase64
+  [switch]$StdinBase64,
+  [switch]$DryRun
 )
 
 $ErrorActionPreference = "Stop"
 
-if ($PSBoundParameters.ContainsKey("JsonLineBase64")) {
+if ($DryRun) {
+  # A dry run only resolves the target pipe, so it must not wait for a payload on stdin.
+  $JsonLine = ""
+} elseif ($PSBoundParameters.ContainsKey("JsonLineBase64")) {
   $JsonLine = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($JsonLineBase64.Trim()))
 } elseif ($StdinBase64) {
   $stdinText = [Console]::In.ReadToEnd()
@@ -22,7 +26,7 @@ if ($PSBoundParameters.ContainsKey("JsonLineBase64")) {
   }
 }
 
-if ($JsonLine.Length -eq 0) {
+if (-not $DryRun -and $JsonLine.Length -eq 0) {
   throw "JsonLine is empty; pass -JsonLine or pipe JSON to stdin."
 }
 
@@ -90,6 +94,9 @@ public static class ClaudeLiveStdinWriter {
   static extern bool DuplicateHandle(IntPtr sourceProcess, IntPtr sourceHandle, IntPtr targetProcess, out IntPtr targetHandle, uint desiredAccess, bool inherit, uint options);
   [DllImport("kernel32.dll", SetLastError=true)]
   static extern uint GetFileType(IntPtr handle);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern bool GetNamedPipeInfo(IntPtr pipe, out uint flags, IntPtr outBufferSize, IntPtr inBufferSize, IntPtr maxInstances);
+  const uint PIPE_SERVER_END = 1;
   [DllImport("kernel32.dll", SetLastError=true)]
   static extern bool WriteFile(IntPtr handle, byte[] buffer, uint bytesToWrite, out uint bytesWritten, IntPtr overlapped);
 
@@ -205,28 +212,55 @@ public static class ClaudeLiveStdinWriter {
     }
   }
 
-  public static int SelectStdinPipe(string stdinName, string[] parentPipeNames) {
-    if (String.IsNullOrWhiteSpace(stdinName) ||
-        !stdinName.StartsWith("\\Device\\NamedPipe\\", StringComparison.OrdinalIgnoreCase) ||
-        stdinName.IndexOf("\\uv\\" + UInt64.MaxValue.ToString() + "-", StringComparison.OrdinalIgnoreCase) >= 0) {
-      throw new Exception("Child stdin has no unambiguous pipe identity; refusing to infer a destination.");
-    }
+  const string LibuvPipePrefix = "\\Device\\NamedPipe\\uv\\";
 
+  static ulong ParseLibuvPipeIndex(int parentPid, string pipeName, string label) {
+    string suffix = "-" + parentPid.ToString();
+    if (pipeName == null ||
+        !pipeName.StartsWith(LibuvPipePrefix, StringComparison.OrdinalIgnoreCase) ||
+        !pipeName.EndsWith(suffix, StringComparison.Ordinal)) {
+      throw new Exception("Child " + label + " is not a libuv pipe of Claude Desktop " + parentPid + ": " + pipeName);
+    }
+    string digits = pipeName.Substring(LibuvPipePrefix.Length, pipeName.Length - LibuvPipePrefix.Length - suffix.Length);
+    ulong index;
+    if (!UInt64.TryParse(digits, out index)) throw new Exception("Child " + label + " pipe index is not numeric: " + pipeName);
+    return index;
+  }
+
+  // libuv names each pipe uv\<counter>-<parentPid> and creates a child's stdin, stdout and
+  // stderr back to back, so stdin is the index just before stdout. The parent's first spawn
+  // underflows that counter to UInt64.MaxValue. The child's own stdin name usually cannot be
+  // read because the child holds it in a blocking read, so the adjacent names are the evidence.
+  public static string ExpectedStdinPipeName(int parentPid, string stdoutName, string stderrName) {
+    ulong stdoutIndex = ParseLibuvPipeIndex(parentPid, stdoutName, "stdout");
+    ulong stderrIndex = ParseLibuvPipeIndex(parentPid, stderrName, "stderr");
+    if (stderrIndex != unchecked(stdoutIndex + 1)) {
+      throw new Exception("Child stdout and stderr pipes are not adjacent (" + stdoutName + ", " + stderrName + "); refusing to infer stdin.");
+    }
+    return LibuvPipePrefix + unchecked(stdoutIndex - 1).ToString() + "-" + parentPid.ToString();
+  }
+
+  public static int SelectStdinPipe(string expectedStdinName, string[] parentPipeNames) {
     int selected = -1;
     for (int i = 0; i < parentPipeNames.Length; i++) {
-      if (!String.Equals(stdinName, parentPipeNames[i], StringComparison.OrdinalIgnoreCase)) continue;
-      if (selected >= 0) throw new Exception("Multiple parent pipes match child stdin; refusing to send.");
+      if (!String.Equals(expectedStdinName, parentPipeNames[i], StringComparison.OrdinalIgnoreCase)) continue;
+      if (selected >= 0) throw new Exception("Multiple parent pipes are named " + expectedStdinName + "; refusing to send.");
       selected = i;
     }
-    if (selected < 0) throw new Exception("No parent pipe matches the actual child stdin; refusing to send.");
+    if (selected < 0) throw new Exception("No writable parent server pipe is named " + expectedStdinName + "; refusing to send.");
     return selected;
   }
 
-  public static string Send(int parentPid, int childPid, string jsonLine) {
+  public static string Send(int parentPid, int childPid, string jsonLine, bool dryRun) {
     var standardHandles = ReadChildStandardHandles(childPid);
-    string stdinName = QueryChildHandleName(childPid, standardHandles["stdin"]);
-    // Reject shared sentinel names before opening any writable parent pipe.
-    SelectStdinPipe(stdinName, new string[] { stdinName });
+    string stdoutName = QueryChildHandleName(childPid, standardHandles["stdout"]);
+    string stderrName = QueryChildHandleName(childPid, standardHandles["stderr"]);
+    string stdinName = ExpectedStdinPipeName(parentPid, stdoutName, stderrName);
+    string observedStdinName = QueryChildHandleName(childPid, standardHandles["stdin"]);
+    if (observedStdinName.StartsWith("\\Device\\", StringComparison.OrdinalIgnoreCase) &&
+        !String.Equals(observedStdinName, stdinName, StringComparison.OrdinalIgnoreCase)) {
+      throw new Exception("Child stdin " + observedStdinName + " disagrees with inferred " + stdinName + "; refusing to send.");
+    }
 
     var handles = QueryHandles();
     IntPtr parent = OpenProcess(PROCESS_DUP_HANDLE, false, parentPid);
@@ -248,6 +282,8 @@ public static class ClaudeLiveStdinWriter {
           if (GetFileType(duplicate) != FILE_TYPE_PIPE) continue;
           string name = QueryNameWithTimeout(duplicate, 150);
           if (!String.Equals(name, stdinName, StringComparison.OrdinalIgnoreCase)) continue;
+          uint pipeFlags;
+          if (!GetNamedPipeInfo(duplicate, out pipeFlags, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero) || (pipeFlags & PIPE_SERVER_END) == 0) continue;
           parentPipes.Add(duplicate);
           parentPipeNames.Add(name);
           parentHandleValues.Add(handleValue);
@@ -257,12 +293,20 @@ public static class ClaudeLiveStdinWriter {
         }
       }
       int selected = SelectStdinPipe(stdinName, parentPipeNames.ToArray());
+      if (dryRun) {
+        return "{\"ok\":true,\"dryRun\":true,\"target\":\"" + EscapeJson(stdinName) +
+          "\",\"stdout\":\"" + EscapeJson(stdoutName) +
+          "\",\"stderr\":\"" + EscapeJson(stderrName) +
+          "\",\"parentHandle\":\"0x" + parentHandleValues[selected].ToString("X") + "\"}";
+      }
       byte[] bytes = Encoding.UTF8.GetBytes(jsonLine + "\n");
       uint written;
       bool ok = WriteFile(parentPipes[selected], bytes, (uint)bytes.Length, out written, IntPtr.Zero);
       int error = Marshal.GetLastWin32Error();
       return "{\"ok\":" + (ok && written == bytes.Length ? "true" : "false") +
         ",\"target\":\"" + EscapeJson(stdinName) +
+        "\",\"stdout\":\"" + EscapeJson(stdoutName) +
+        "\",\"stderr\":\"" + EscapeJson(stderrName) +
         "\",\"parentHandle\":\"0x" + parentHandleValues[selected].ToString("X") +
         "\",\"bytes\":" + bytes.Length +
         ",\"written\":" + written +
@@ -281,4 +325,4 @@ public static class ClaudeLiveStdinWriter {
 '@
 
 Add-Type -TypeDefinition $src
-[ClaudeLiveStdinWriter]::Send($ParentPid, $ChildPid, $JsonLine)
+[ClaudeLiveStdinWriter]::Send($ParentPid, $ChildPid, $JsonLine, [bool]$DryRun)

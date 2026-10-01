@@ -12,10 +12,17 @@ const helperPath = fileURLToPath(new URL("./claude_peer_pipe.ps1", import.meta.u
 const outboxRoot = path.join(os.homedir(), ".claude-codex-bridge", "peer-outbox");
 const legacyOutboxRoot = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), ".local", "state"), "claude-codex-bridge", "peer-outbox");
 
+function sessionIdentityKey(session) {
+  return JSON.stringify([session.sessionId, session.cliSessionId, String(session.cwd || "").toLowerCase()]);
+}
+
 export function findSessionById(sessions, id) {
   const matches = sessions.filter((session) => session.sessionId === id || session.cliSessionId === id);
-  if (matches.length !== 1) throw new Error(`Expected one Claude session for ${id}; found ${matches.length}`);
-  return matches[0];
+  // The packaged Claude Desktop exposes one metadata file under both AppData\Roaming\Claude and
+  // its Packages\...\LocalCache\Roaming\Claude view. Copies with the same identity are one session.
+  const identities = new Set(matches.map(sessionIdentityKey));
+  if (identities.size !== 1) throw new Error(`Expected one Claude session for ${id}; found ${identities.size}`);
+  return matches.reduce((newest, session) => (Number(session.mtimeMs) || 0) > (Number(newest.mtimeMs) || 0) ? session : newest);
 }
 
 function readRecord(pid) {

@@ -115,6 +115,7 @@ function usage() {
   claude_code_bridge.mjs code send --prompt TEXT --session-id ID [--cwd PATH] [--wait] [--transport auto|renderer|raw|peer|live-stdin|cli]
   claude_code_bridge.mjs code peer-probe --session-id ID [--cwd PATH] [--json]
   claude_code_bridge.mjs code peer-receipt --session-id ID --message-id UUID [--json]
+  claude_code_bridge.mjs code set-permission-mode --session-id ID --mode default|acceptEdits|plan|auto|bypassPermissions [--dry-run] [--json]
   claude_code_bridge.mjs cowork start --prompt TEXT [--cwd PATH] [--title TEXT] [--wait]
   claude_code_bridge.mjs cowork send --prompt TEXT [--session-id local_...] [--wait]
   claude_code_bridge.mjs read [--surface code|cowork] [--cwd PATH] [--session-id local_...] [--lines N] [--json]
@@ -2295,7 +2296,7 @@ function claudeCodeStreamJsonUserFrame(prompt) {
   });
 }
 
-function runLiveStdinHelper(parentPid, childPid, jsonLine) {
+function runLiveStdinHelper(parentPid, childPid, jsonLine, { dryRun = false } = {}) {
   if (process.platform !== "win32") {
     throw new CliError("live-stdin transport is only supported on Windows");
   }
@@ -2316,11 +2317,11 @@ function runLiveStdinHelper(parentPid, childPid, jsonLine) {
       String(parentPid),
       "-ChildPid",
       String(childPid),
-      "-StdinBase64",
+      ...(dryRun ? ["-DryRun"] : ["-StdinBase64"]),
     ],
     {
       encoding: "utf8",
-      input: Buffer.from(jsonLine, "utf8").toString("base64"),
+      input: dryRun ? "" : Buffer.from(jsonLine, "utf8").toString("base64"),
       timeout: 15000,
       windowsHide: true,
     },
@@ -2333,6 +2334,65 @@ function runLiveStdinHelper(parentPid, childPid, jsonLine) {
   }
 }
 
+function resolveLiveCodeProcess(session) {
+  const liveProcess = findLiveClaudeCodeProcessForSession(session);
+  if (!liveProcess) {
+    throw new CliError(`No running Claude Desktop claude-code child found for cliSessionId ${session.cliSessionId}`);
+  }
+  const childPid = Number(liveProcess.ProcessId || liveProcess.processId || 0);
+  const parentPid = findDesktopParentPidForCodeProcess(liveProcess);
+  if (!childPid || !parentPid) {
+    throw new CliError("Could not resolve live Claude Desktop parent/child PIDs", 2, { liveProcess });
+  }
+  return { liveProcess, childPid, parentPid };
+}
+
+const CLAUDE_PERMISSION_MODES = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
+
+function buildPermissionModeControlFrame(mode, requestId = crypto.randomUUID()) {
+  if (!CLAUDE_PERMISSION_MODES.includes(mode)) {
+    throw new CliError(`--mode must be one of ${CLAUDE_PERMISSION_MODES.join(", ")}`);
+  }
+  // Same control request the Claude Agent SDK sends for query.setPermissionMode().
+  return JSON.stringify({ type: "control_request", request_id: requestId, request: { subtype: "set_permission_mode", mode } });
+}
+
+function permissionModeLaunchBlocker(commandLine, mode) {
+  if (mode !== "bypassPermissions") return null;
+  // Claude Code only accepts a runtime switch to bypass when the process was launched with one of these flags.
+  if (/(?:^|\s)--(?:allow-)?dangerously-skip-permissions(?:\s|$)/.test(String(commandLine || ""))) return null;
+  return "This Claude Code process was not launched with --allow-dangerously-skip-permissions, so it would reject bypassPermissions.";
+}
+
+async function cmdSetPermissionMode(args, surface) {
+  if (surface !== "code" || !(args["session-id"] || args.sessionId)) {
+    throw new CliError("code set-permission-mode requires an explicit --session-id");
+  }
+  const mode = String(args.mode || "");
+  const requestId = crypto.randomUUID();
+  const frame = buildPermissionModeControlFrame(mode, requestId);
+  const session = resolveSession(surface, args);
+  const { liveProcess, childPid, parentPid } = resolveLiveCodeProcess(session);
+  const blocker = permissionModeLaunchBlocker(liveProcess.CommandLine || liveProcess.commandLine, mode);
+  if (blocker) throw new CliError(blocker, 2, { childPid });
+  const dryRun = toBool(args["dry-run"]);
+  const helper = runLiveStdinHelper(parentPid, childPid, frame, { dryRun });
+  if (!helper.ok) throw new CliError("live-stdin helper failed to write the permission mode request", 2, helper);
+  printJson({
+    ok: true,
+    dryRun,
+    sessionId: session.sessionId,
+    cliSessionId: session.cliSessionId,
+    mode,
+    requestId,
+    parentPid,
+    childPid,
+    helper,
+    // The control_response goes to Claude Desktop on the child's stdout, so the bridge cannot read it.
+    note: "Written to the running Claude Code process. Claude Desktop relaunches a session with its own stored mode, so a restarted process returns to that mode.",
+  });
+}
+
 async function codeLiveStdinAction(_args, surface, session, prompt) {
   if (surface !== "code") {
     throw new CliError("live-stdin transport only supports Code sessions");
@@ -2341,17 +2401,7 @@ async function codeLiveStdinAction(_args, surface, session, prompt) {
     throw new CliError(`Code session has no cliSessionId: ${session.sessionId}`);
   }
 
-  const liveProcess = findLiveClaudeCodeProcessForSession(session);
-  if (!liveProcess) {
-    throw new CliError(`No running Claude Desktop claude-code child found for cliSessionId ${session.cliSessionId}`);
-  }
-
-  const childPid = Number(liveProcess.ProcessId || liveProcess.processId || 0);
-  const parentPid = findDesktopParentPidForCodeProcess(liveProcess);
-  if (!childPid || !parentPid) {
-    throw new CliError("Could not resolve live Claude Desktop parent/child PIDs", 2, { liveProcess });
-  }
-
+  const { liveProcess, childPid, parentPid } = resolveLiveCodeProcess(session);
   const frame = claudeCodeStreamJsonUserFrame(prompt);
   const helper = runLiveStdinHelper(parentPid, childPid, frame);
   if (!helper.ok) {
@@ -2843,6 +2893,15 @@ async function cmdWait(args, surface) {
 }
 
 async function cmdSelftest() {
+  const permissionFrame = JSON.parse(buildPermissionModeControlFrame("bypassPermissions", "request-1"));
+  assert(permissionFrame.type === "control_request" && permissionFrame.request_id === "request-1", "permission frame is a control request");
+  assert(permissionFrame.request.subtype === "set_permission_mode" && permissionFrame.request.mode === "bypassPermissions", "permission frame carries the requested mode");
+  let rejectedMode = false;
+  try { buildPermissionModeControlFrame("everything"); } catch { rejectedMode = true; }
+  assert(rejectedMode, "unknown permission mode rejected");
+  assert(permissionModeLaunchBlocker("claude.exe --permission-mode default --allow-dangerously-skip-permissions --resume=x", "bypassPermissions") === null, "bypass allowed when launch flag present");
+  assert(permissionModeLaunchBlocker("claude.exe --permission-mode default --resume=x", "bypassPermissions") !== null, "bypass blocked without launch flag");
+  assert(permissionModeLaunchBlocker("claude.exe --permission-mode default --resume=x", "acceptEdits") === null, "non-bypass modes need no launch flag");
   const initialSession = {
     cliSessionId: "target-session",
     createdAt: Date.parse("2026-09-30T16:03:38.634Z"),
@@ -2964,6 +3023,9 @@ async function main() {
       return;
     case "peer-receipt":
       await cmdPeerReceipt(args, surface);
+      return;
+    case "set-permission-mode":
+      await cmdSetPermissionMode(args, surface);
       return;
     case "read":
       await cmdRead(args, surface);

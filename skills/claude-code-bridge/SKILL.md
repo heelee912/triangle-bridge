@@ -48,7 +48,35 @@ After the user starts it, Claude can use `list_sessions`, `get_session` and `lis
 
 Resolve the new CLI session ID from local metadata and the live runtime registry. Run `code peer-probe --session-id ID` and read its first response before handing it to the assigned collaborator. Preserve the created model and permissions unless the user requests changes.
 
-A destination missing from local `codex_bridge status` is not proof that its ID is invalid. Check it with the available Codex app `read_thread` tool. A cloud-backed destination may require its authorized local coordinator to relay messages. Do not substitute an unrelated session.
+A destination missing from local `codex_bridge status` is not proof that its ID is invalid. Verify its observed host and the local calling context. Do not substitute an unrelated session or start a coordinator turn merely to relay the message.
+
+For an observed cloud host, keep the local app caller context separate from the destination. Pass both explicitly; do not guess the newest local thread. This uses the same app pipe without starting a coordinator model turn:
+
+```powershell
+node $codex status --thread EXACT_CLOUD_ID --context-thread EXACT_LOCAL_CALLER_ID --host-id OBSERVED_HOST_ID
+node $codex send --thread EXACT_CLOUD_ID --context-thread EXACT_LOCAL_CALLER_ID --host-id OBSERVED_HOST_ID --prompt-file "C:\Temp\reply.md"
+```
+
+The bridge verifies the exact destination and host before sending. A local caller context is not the remote recipient or proof of the message author's identity. Acknowledgement and actual destination receipt remain separate.
+
+For a reply-only read, the sender must publish an assistant message with the agreed request-specific tag as its complete first line:
+
+```powershell
+node $codex reply --thread EXACT_CLOUD_ID --context-thread EXACT_LOCAL_CALLER_ID --host-id OBSERVED_HOST_ID --reply-tag "[Claude reply REQUEST_UUID]" --after-cursor PREVIOUS_CURSOR
+```
+
+Omit `--after-cursor` on the first read. Optional `--message-id` and `--turn-id` pin a known reply. This performs one immediate `wait_threads` snapshot without reading history or sending a prompt. Only a matching assistant message is returned. Other commentary, tool data and unmatched text are not returned. A tag is a selection filter, not authenticated author identity. The API exposes the latest message, not a durable reply queue; an absent or superseded reply is not delivery confirmation. Never fall back to full history or repeat an unknown send to recover it.
+
+## Explicit Permission Changes
+
+Change a running Claude session's permissions only when the user explicitly requests that change. Ordinary message delivery must preserve the recipient's permission mode.
+
+```powershell
+node $claude code set-permission-mode --session-id EXACT_CLAUDE_ID --mode acceptEdits --dry-run --json
+node $claude code set-permission-mode --session-id EXACT_CLAUDE_ID --mode acceptEdits --json
+```
+
+The dry run resolves the exact process and writable stdin pipe without sending a control request. A successful write is not confirmation that Claude accepted the mode; its control response goes to Desktop rather than this bridge. Verify the resulting recipient state before claiming activation. `bypassPermissions` requires a process launched with the corresponding allow/skip-permissions flag. Do not restart the app to add that flag as an automatic fallback. This command changes the running process only; a restarted Desktop session returns to its stored mode.
 
 ## Scope
 

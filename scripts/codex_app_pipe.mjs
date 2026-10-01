@@ -112,7 +112,33 @@ export function decodeToolResult(result) {
   return { text: texts.join('\n') };
 }
 
-export async function openAppTools(threadId, { timeoutMs = 15000, endpoints } = {}) {
+export function projectPublishedReply(snapshot, threadId, hostId, filter) {
+  if (typeof filter?.tag !== 'string' || !filter.tag.trim() || /[\r\n]/.test(filter.tag)) {
+    throw new Error('Pass a nonempty single-line reply tag');
+  }
+  const polls = Array.isArray(snapshot?.polls) ? snapshot.polls.filter(poll => poll.thread?.id === threadId) : [];
+  if (polls.length !== 1) throw new Error('Target reply snapshot unavailable');
+  const poll = polls[0];
+  if (!hostId || poll.thread.hostId !== hostId) throw new Error('Target reply host did not match');
+  if (typeof poll.cursor !== 'string' || typeof poll.changed !== 'boolean') throw new Error('Invalid reply cursor snapshot');
+  const result = { state: 'no-published-reply', cursor: poll.cursor, activeTurn: poll.latestTurn?.status === 'inProgress' };
+  if (!poll.changed) return { ...result, state: 'no-new-reply' };
+  const message = poll.latestAssistantMessage;
+  if (!message) return result;
+  if (typeof message.text !== 'string' || typeof message.id !== 'string' || !message.id ||
+      typeof message.turnId !== 'string' || !message.turnId || message.truncated === true ||
+      (message.phase !== undefined && !['commentary', 'final'].includes(message.phase)) ||
+      message.text.split(/\r?\n/, 1)[0] !== filter.tag ||
+      (filter.messageId && message.id !== filter.messageId) ||
+      (filter.turnId && message.turnId !== filter.turnId)) return { ...result, state: 'reply-not-matched' };
+  return { ...result, state: 'reply-visible', message: { id: message.id, turnId: message.turnId,
+    ...(message.phase ? { phase: message.phase } : {}), text: message.text } };
+}
+
+export async function openAppTools(threadId, { timeoutMs = 15000, endpoints, callerThreadId = threadId, hostId, replyFilter } = {}) {
+  if (replyFilter && (!hostId || typeof replyFilter.tag !== 'string' || !replyFilter.tag.trim() || /[\r\n]/.test(replyFilter.tag))) {
+    throw new Error('Reply-only reads require an exact host and a nonempty single-line reply tag');
+  }
   if (!endpoints) {
     if (process.platform !== 'win32') throw new Error('App-tool pipe discovery currently requires Windows');
     endpoints = fs.readdirSync('\\\\.\\pipe\\')
@@ -126,13 +152,23 @@ export async function openAppTools(threadId, { timeoutMs = 15000, endpoints } = 
     try {
       await pipe.connect();
       const catalog = await pipe.request('tools/list');
-      if (!['read_thread', 'send_message_to_thread'].every(name =>
+      if (!(replyFilter ? ['wait_threads'] : ['read_thread', 'send_message_to_thread']).every(name =>
         catalog?.tools?.some(tool => tool.namespace === 'codex_app' && tool.name === name))) {
         throw new Error('Endpoint does not expose Codex thread tools');
       }
-      const state = decodeToolResult(await pipe.request('tools/call', toolParams(threadId,
-        'read_thread', { threadId, turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 0 })));
+      if (replyFilter) {
+        const raw = await pipe.request('tools/call', toolParams(callerThreadId, 'wait_threads', {
+          targets: [{ threadId, hostId, ...(replyFilter.afterCursor ? { afterCursor: replyFilter.afterCursor } : {}) }], timeoutMs: 0,
+        }));
+        let snapshot;
+        try { snapshot = decodeToolResult(raw); } catch { throw new Error('Reply snapshot decode failed'); }
+        const reply = projectPublishedReply(snapshot, threadId, hostId, replyFilter);
+        return { pipe, reply };
+      }
+      const state = decodeToolResult(await pipe.request('tools/call', toolParams(callerThreadId,
+        'read_thread', { threadId, ...(hostId ? { hostId } : {}), turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 0 })));
       if (state.thread?.id !== threadId) throw new Error('Target thread readback did not match');
+      if (hostId && state.thread?.hostId !== hostId) throw new Error('Target thread host did not match');
       return { pipe, state };
     } catch (error) {
       pipe.close();

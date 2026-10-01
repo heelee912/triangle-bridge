@@ -283,6 +283,8 @@ async function main() {
       'status --thread <Codex thread ID>',
       'send --thread <Codex thread ID> --prompt-file <UTF-8 file>',
       'read --thread <Codex thread ID> --turn-limit 2',
+      'reply --thread <exact ID> --host-id <host> --reply-tag <published first line> [--after-cursor <cursor>] [--message-id <ID>] [--turn-id <ID>]',
+      'Cloud targets: --context-thread <local caller thread ID> --host-id <observed target host>',
       'list',
     ], transport: 'Standalone local Codex app tool pipe; no OmniCodex dependency',
       delivery: 'Send returns the native acknowledgement; read distinguishes queued input from a completed reply. Unknown delivery is not automatically retried.' });
@@ -291,7 +293,12 @@ async function main() {
 
   // Use the app's own send/read path, including its active-turn handling.
   // This remains a standalone named-pipe client, not an OmniCodex MCP client.
-  if (['send', 'read', 'status'].includes(cmd) && args.transport !== 'ipc') {
+  if (cmd === 'reply' && args.transport === 'ipc') {
+    out({ ok: false, error: 'Reply-only reads require the app-tools transport' });
+    process.exitCode = 1;
+    return;
+  }
+  if (['send', 'read', 'status', 'reply'].includes(cmd) && args.transport !== 'ipc') {
     let pipe;
     try {
       if (cmd !== 'status' && !args.thread && !args['conversation-id'] && !args.name) {
@@ -300,21 +307,27 @@ async function main() {
       const conversationId = args.thread || args['conversation-id'] ||
         (args.name ? resolveTarget(args) : process.env.CODEX_THREAD_ID);
       if (!conversationId) throw new Error('Pass --thread <exact thread ID>');
+      const callerThreadId = args['context-thread'] || conversationId;
+      const hostId = args['host-id'];
       const prompt = cmd === 'send' ? loadPrompt(args) : undefined;
-      const ready = await openAppTools(conversationId);
+      const replyFilter = cmd === 'reply' ? { tag: args['reply-tag'], afterCursor: args['after-cursor'],
+        messageId: args['message-id'], turnId: args['turn-id'] } : undefined;
+      const ready = await openAppTools(conversationId, { callerThreadId, hostId, replyFilter });
       pipe = ready.pipe;
-      if (cmd === 'status') {
+      if (cmd === 'reply') {
+        out({ ok: true, conversationId, hostId, ...ready.reply });
+      } else if (cmd === 'status') {
         out({ ok: true, transport: 'app-tools-pipe', pipe: pipe.endpoint,
-          conversationId, thread: ready.state.thread });
+          conversationId, callerThreadId, thread: ready.state.thread });
       } else if (cmd === 'read') {
-        const result = decodeToolResult(await pipe.request('tools/call', toolParams(conversationId,
-          'read_thread', { threadId: conversationId, turnLimit: Number(args['turn-limit'] || 2),
+        const result = decodeToolResult(await pipe.request('tools/call', toolParams(callerThreadId,
+          'read_thread', { threadId: conversationId, ...(hostId ? { hostId } : {}), turnLimit: Number(args['turn-limit'] || 2),
             includeOutputs: false, maxOutputCharsPerItem: 2000 })));
         out({ ok: true, conversationId, response: result });
       } else {
         const callId = randomUUID();
-        const result = decodeToolResult(await pipe.request('tools/call', toolParams(conversationId,
-          'send_message_to_thread', { threadId: conversationId, prompt }, callId),
+        const result = decodeToolResult(await pipe.request('tools/call', toolParams(callerThreadId,
+          'send_message_to_thread', { threadId: conversationId, ...(hostId ? { hostId } : {}), prompt }, callId),
           { mutation: true, timeoutMs: 60000 }));
         if (result.threadId !== conversationId) {
           const error = new Error('Send acknowledgement did not identify the intended thread; read before retrying');

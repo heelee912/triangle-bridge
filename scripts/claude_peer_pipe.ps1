@@ -6,7 +6,7 @@ try {
   $r = $envelope.runtime
   if ($r.socketPath -notmatch '^\\\\\.\\pipe\\LOCAL\\cc-msg-[0-9a-f]{32}$') { throw 'Invalid Claude inbox pipe path' }
   $recordPath = Join-Path $env:USERPROFILE ".claude\sessions\$($r.pid).json"
-  $record = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+  $record = Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
   if ($record.pid -ne $r.pid -or $record.sessionId -cne $r.sessionId -or $record.procStart -ne $r.procStart -or $record.messagingSocketPath -cne $r.socketPath -or $record.cwd -ine $r.cwd) { throw 'Claude runtime record changed before connection' }
   $process = [Diagnostics.Process]::GetProcessById([int]$r.pid)
   if ($process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() -ne $r.procStart) { throw 'Claude PID was reused or the runtime record is stale' }

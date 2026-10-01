@@ -6,12 +6,61 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import net from "node:net";
+import { randomUUID } from "node:crypto";
 import { buildPeerFrame, createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, parsePeerHelperReply, peerReceipt, reservePeerMessage, validatePeerKey, waitForPeerReceipt, withPeerOutboxLock } from "./claude_peer_transport.mjs";
 
 const session = { cliSessionId: "target", cwd: "C:\\Projects\\YomiLayer" };
 const runtime = { pid: 42, sessionId: "target", cwd: session.cwd, procStart: "123456789", entrypoint: "claude-desktop", peerProtocol: 1, messagingSocketPath: "\\\\.\\pipe\\LOCAL\\cc-msg-" + "a".repeat(32) };
 const child = { ProcessId: 42, CommandLine: "claude.exe --input-format stream-json" };
 const sender = { senderMode: "bypass", senderSessionId: "codex-session" };
+
+test("Windows peer helper preserves UTF-8 checkout identity and still rejects a different checkout", { skip: process.platform !== "win32" }, async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "claude-peer-utf8-"));
+  const records = path.join(home, ".claude", "sessions");
+  fs.mkdirSync(records, { recursive: true });
+  const socketPath = "\\\\.\\pipe\\LOCAL\\cc-msg-" + randomUUID().replaceAll("-", "");
+  const sockets = new Set();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(socketPath, resolve);
+  });
+  t.after(() => {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+    fs.rmSync(home, { recursive: true, force: true });
+  });
+  const start = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+    `([Diagnostics.Process]::GetProcessById(${process.pid})).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()`],
+  { encoding: "utf8", windowsHide: true, timeout: 10000 });
+  assert.equal(start.status, 0, start.stderr);
+  const target = { pid: process.pid, sessionId: randomUUID(), cwd: "C:\\Projects\\주식_日本語", procStart: start.stdout.trim(), socketPath };
+  fs.writeFileSync(path.join(records, `${process.pid}.json`), JSON.stringify({ ...target, messagingSocketPath: socketPath }), "utf8");
+  async function probe(destination) {
+    const helper = fileURLToPath(new URL("./claude_peer_pipe.ps1", import.meta.url));
+    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper],
+      { env: { ...process.env, USERPROFILE: home }, windowsHide: true, timeout: 15000 });
+    let stdout = "", stderr = "";
+    child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
+    child.stdin.end(Buffer.from(JSON.stringify({ runtime: destination, probe: true }), "utf8").toString("base64"));
+    const [code] = await once(child, "close");
+    assert.equal(code, 0, stderr);
+    return JSON.parse(stdout.trim());
+  }
+  const accepted = await probe(target);
+  assert.equal(accepted.ok, true, accepted.error);
+  assert.equal(accepted.serverPid, process.pid);
+  assert.equal(accepted.sessionId, target.sessionId);
+  const rejected = await probe({ ...target, cwd: "C:\\Other" });
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.delivery, "not-sent");
+  assert.match(rejected.error, /runtime record changed/);
+});
 
 test("Claude v1 inbox keys use 16-byte hex tokens and exact Windows process-start identity", () => {
   const destination = { procStart: "123456789", pidDomain: "win32:pc" };
@@ -28,7 +77,15 @@ test("explicit ID accepts either Desktop or CLI ID without falling back to newes
   assert.equal(findSessionById(sessions, "target"), target);
   assert.equal(findSessionById(sessions, "local_target"), target);
   assert.throws(() => findSessionById(sessions, "unknown"), /found 0/);
-  assert.throws(() => findSessionById([...sessions, { ...target }], "target"), /found 2/);
+  assert.throws(() => findSessionById([...sessions, { ...target, cwd: "C:\\Other" }], "target"), /found 2/);
+  assert.throws(() => findSessionById([...sessions, { ...target, sessionId: "local_other" }], "target"), /found 2/);
+});
+
+test("mirrored metadata copies of one session resolve to the newest copy", () => {
+  const roaming = { sessionId: "local_target", cliSessionId: "target", cwd: "C:\\Repo", mtimeMs: 1, filePath: "Roaming" };
+  const packaged = { ...roaming, cwd: "c:\\repo", mtimeMs: 2, filePath: "Packages" };
+  assert.equal(findSessionById([roaming, packaged], "target"), packaged);
+  assert.equal(findSessionById([packaged, roaming], "local_target"), packaged);
 });
 
 test("runtime registry identifies a Desktop child without --resume", () => {
