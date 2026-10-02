@@ -30,13 +30,27 @@ node $codex send --thread TARGET_CODEX_ID --prompt-file "C:\Temp\reply.md"
 
 `ACTUAL_SENDER_MODE` is `bypass` only when the sender truly has full unrestricted access without approval; otherwise use `prompting`. Do not infer it from the recipient's mode. If `CODEX_THREAD_ID` is unavailable, resolve the actual sending thread explicitly rather than guessing.
 
-Peer sends require both sender options. The outbox stores request IDs and states under `%USERPROFILE%\.claude-codex-bridge\peer-outbox`, not prompt text or account credentials. A duplicate unconfirmed prompt to the same recipient is refused even from another bridge process. Use `code peer-receipt --session-id ID --message-id UUID` to reconcile a delayed receipt or a send without `--wait`. It updates the outbox only when the exact request appears in that target's transcript. Confirmed requests can be sent again as an intentional new turn. Windows outbox locking uses an exclusive live named pipe, which the OS releases after a process crash; it does not leave persistent `.lock` files.
+Peer sends require both sender options. Claude holds a message from a `bypass` sender for its user's approval when the recipient runs in another mode, so the message never reaches the transcript. The peer send refuses that case before writing and names the recipient mode; switch the recipient with `code set-permission-mode` first, or pass `--allow-held` deliberately. The outbox stores request IDs and states under `%USERPROFILE%\.claude-codex-bridge\peer-outbox`, not prompt text or account credentials. A duplicate unconfirmed prompt to the same recipient is refused even from another bridge process. Use `code peer-receipt --session-id ID --message-id UUID` to reconcile a delayed receipt or a send without `--wait`. It updates the outbox only when the exact request appears in that target's transcript. Confirmed requests can be sent again as an intentional new turn. Windows outbox locking uses an exclusive live named pipe, which the OS releases after a process crash; it does not leave persistent `.lock` files.
 
 Pipe writes and an assistant's initial text are not completion of the assigned work. Confirm the matching target transcript and final response or return message. `codex_bridge.mjs` returning `app-acknowledged` confirms app acceptance; read the destination for actual receipt and completion.
 
 ## Starting A New Claude Code Session
 
-Use `code start` when the live `LocalSessions` API is available. If it is unavailable, an explicitly authorized existing Claude session can use its native `mcp__ccd_session__spawn_task` tool:
+Use `code create` to make a new Claude Desktop sidebar session without any click. Write the first instruction to a UTF-8 file first:
+
+```powershell
+node $claude code create --cwd "C:\Projects\Example" --title "Short session title" --prompt-file "C:\Temp\instruction.md" --json
+```
+
+It runs Claude Desktop's own `claude.exe` once in print mode with a fresh `--session-id` and `--name`. It gives that one process Desktop's `user:inference` OAuth token through `CLAUDE_CODE_OAUTH_TOKEN`, so no credential file changes. It then passes `claude://resume?session=ID` to the running app through the `claude-desktop.exe` execution alias, which avoids the Windows "switch apps" confirmation. Desktop imports the transcript, trusts the folder without a dialog and starts the session process.
+
+New sessions default to `bypassPermissions`. Desktop deliberately downgrades an imported bypass session to `acceptEdits`, so `create` then sends the SDK `set_permission_mode` control request to the started process and waits until Desktop records `bypassPermissions` (the fifth option in the app's mode menu). Pass `--permission-mode acceptEdits` or another mode to start differently. Model and effort default to the most recently updated Desktop session.
+
+The result names `cliSessionId`, `desktopSessionId`, the first reply, `desktopPermissionMode` and `permissionEnforcement`. A `desktop-import` failure means the CLI session exists but Desktop did not list it; do not create another session. Open the reported deep link again instead. `--no-open` stops after the first turn.
+
+`code wake --session-id ID` opens an idle Desktop session through the same alias so Desktop starts its process. A peer send wakes an idle recipient automatically. A recipient without a process has no runtime registry entry, which otherwise looks like a missing session.
+
+Use `code start` when the live `LocalSessions` API is available. As a fallback, an explicitly authorized existing Claude session can use its native `mcp__ccd_session__spawn_task` tool, which needs the user's click:
 
 ```json
 {"title":"Short session title","tldr":"Purpose of the new session","prompt":"Initial instruction","cwd":"C:\\path\\to\\project"}

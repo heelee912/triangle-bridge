@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildCreateCliArgs, createCodeSession, findImportedSession, resumeDeepLink } from "./claude_session_create.mjs";
 import { createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, peerReceipt, probePeer, sendPeer, waitForPeerReceipt } from "./claude_peer_transport.mjs";
 
 const CODE_MODEL = "claude-opus-4-8";
@@ -115,6 +116,8 @@ function usage() {
   claude_code_bridge.mjs code send --prompt TEXT --session-id ID [--cwd PATH] [--wait] [--transport auto|renderer|raw|peer|live-stdin|cli]
   claude_code_bridge.mjs code peer-probe --session-id ID [--cwd PATH] [--json]
   claude_code_bridge.mjs code peer-receipt --session-id ID --message-id UUID [--json]
+  claude_code_bridge.mjs code create --cwd PATH --prompt-file FILE [--title TEXT] [--permission-mode bypassPermissions] [--model ID] [--effort LEVEL] [--no-open] [--json]
+  claude_code_bridge.mjs code wake --session-id ID [--json]     Open an idle Desktop session so its process starts.
   claude_code_bridge.mjs code set-permission-mode --session-id ID --mode default|acceptEdits|plan|auto|bypassPermissions [--dry-run] [--json]
   claude_code_bridge.mjs cowork start --prompt TEXT [--cwd PATH] [--title TEXT] [--wait]
   claude_code_bridge.mjs cowork send --prompt TEXT [--session-id local_...] [--wait]
@@ -821,6 +824,117 @@ function selectDesktopClaudeCodeOauth(cache) {
   const [cacheKey, token] = candidates[0];
   const scopes = cacheKey.split(":").slice(4).join(":").split(/\s+/).filter(Boolean);
   return { cacheKey, token, scopes };
+}
+
+function selectDesktopInferenceToken(cache) {
+  // Claude Desktop now keeps long-lived user:inference tokens for its Code children.
+  const candidates = Object.entries(cache)
+    .filter(([key, value]) => /(?:^|[\s:])user:inference(?:\s|$)/.test(key) && typeof value?.token === "string" && value.token.length > 0)
+    .sort((a, b) => (b[1].expiresAt || 0) - (a[1].expiresAt || 0));
+  if (!candidates.length) throw new CliError("no Desktop OAuth token with user:inference scope found");
+  return candidates[0][1].token;
+}
+
+function runCliWithStdin(executablePath, cliArgs, { cwd, env, input, timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    const child = spawn(executablePath, cliArgs, { cwd, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* already exited */ }
+      reject(new CliError("Claude Code first turn timed out", 3, { timeoutMs, stdout: stdout.slice(-2000), stderr: stderr.slice(-2000) }));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => { stdout += chunk.toString("utf8"); });
+    child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+    child.on("error", (error) => { clearTimeout(timer); reject(error); });
+    child.on("close", (code) => { clearTimeout(timer); resolve({ code, stdout, stderr }); });
+    child.stdin.end(Buffer.from(input, "utf8"));
+  });
+}
+
+function claudeDesktopExecutionAlias() {
+  const alias = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Microsoft", "WindowsApps", "claude-desktop.exe");
+  // App execution aliases are reparse points that fs.existsSync cannot stat; lstat sees them.
+  try { fs.lstatSync(alias); return alias; } catch { return null; }
+}
+
+function openClaudeDeepLink(url) {
+  if (!/^claude:\/\/[a-z.-]+(?:\/[A-Za-z0-9_\/-]*)?(?:\?[A-Za-z0-9=%&._-]+)?$/.test(url)) throw new CliError(`refusing to open unexpected deep link: ${url}`);
+  const alias = claudeDesktopExecutionAlias();
+  if (alias) {
+    // The packaged app's execution alias forwards the URL to the running instance as a
+    // second-instance argument. Windows protocol activation from a background process
+    // instead shows a "switch apps" confirmation that the user must click.
+    execFileSync(alias, [url], { windowsHide: true, stdio: "ignore", timeout: 30000 });
+    return "execution-alias";
+  }
+  execFileSync("rundll32.exe", ["url.dll,FileProtocolHandler", url], { windowsHide: true });
+  return "protocol-handler";
+}
+
+function applyRuntimePermissionMode(session, mode, { dryRun = false } = {}) {
+  const requestId = crypto.randomUUID();
+  const frame = buildPermissionModeControlFrame(mode, requestId);
+  const { liveProcess, childPid, parentPid } = resolveLiveCodeProcess(session);
+  const blocker = permissionModeLaunchBlocker(liveProcess.CommandLine || liveProcess.commandLine, mode);
+  if (blocker) throw new CliError(blocker, 2, { childPid });
+  const helper = runLiveStdinHelper(parentPid, childPid, frame, { dryRun });
+  if (!helper.ok) throw new CliError("live-stdin helper failed to write the permission mode request", 2, helper);
+  return { requestId, parentPid, childPid, helper };
+}
+
+async function enforceDesktopPermissionMode(cliSessionId, mode, timeoutMs) {
+  // Claude Desktop downgrades an imported bypass session to acceptEdits. Once Desktop has
+  // launched the session process, the same set_permission_mode control request the SDK uses
+  // switches it, and Desktop records the mode the process reports.
+  const session = await waitForCondition(() => {
+    const found = findImportedSession(listSessions("code"), cliSessionId);
+    return found && findLiveClaudeCodeProcessForSession(found) ? found : null;
+  }, timeoutMs).catch(() => null);
+  if (!session) return { applied: false, reason: "Claude Desktop did not start the session process" };
+  const runtime = applyRuntimePermissionMode(session, mode);
+  const recorded = await waitForCondition(() => {
+    const current = findImportedSession(listSessions("code"), cliSessionId);
+    return current?.permissionMode === mode ? current : null;
+  }, timeoutMs).catch(() => null);
+  return { applied: true, childPid: runtime.childPid, requestId: runtime.requestId, desktopRecordedMode: recorded?.permissionMode || findImportedSession(listSessions("code"), cliSessionId)?.permissionMode || null };
+}
+
+async function cmdCreate(args, surface, rest) {
+  if (surface !== "code") throw new CliError("create only supports Code sessions");
+  if (!args.cwd) throw new CliError("code create requires --cwd");
+  const prompt = readPrompt(args, rest);
+  const executablePath = findClaudeCodeExecutable();
+  if (!executablePath) throw new CliError("Claude Desktop claude.exe was not found");
+  const recentDesktop = listSessions("code").sort((x, y) => (Number(y.updatedAt) || 0) - (Number(x.updatedAt) || 0))[0];
+  const result = await createCodeSession(
+    {
+      cwd: resolveCwd(args.cwd),
+      prompt,
+      title: args.title,
+      // A new session follows the model the user currently runs in Desktop, not a hard-coded default.
+      model: args.model || recentDesktop?.model || CODE_MODEL,
+      effort: args.effort || recentDesktop?.effort || CODE_EFFORT,
+      permissionMode: args["permission-mode"] || "bypassPermissions",
+      timeoutMs: toInt(args["timeout-ms"], DEFAULT_CLI_TIMEOUT_MS),
+      importTimeoutMs: toInt(args["import-timeout-ms"], 30000),
+      open: !toBool(args["no-open"]),
+    },
+    {
+      executablePath,
+      inferenceToken: () => selectDesktopInferenceToken(readDesktopOauthTokenCache()),
+      runCli: runCliWithStdin,
+      transcriptPath: (cwd, sessionId) => path.join(transcriptRoot, encodeProjectPath(cwd), `${sessionId}.jsonl`),
+      openUrl: openClaudeDeepLink,
+      listCodeSessions: () => listSessions("code"),
+    },
+  );
+  let permission = null;
+  if (result.desktopImported && result.permissionMode !== "acceptEdits" && result.desktopPermissionMode !== result.permissionMode) {
+    permission = await enforceDesktopPermissionMode(result.cliSessionId, result.permissionMode, toInt(args["import-timeout-ms"], 30000));
+  }
+  const finalMode = findImportedSession(listSessions("code"), result.cliSessionId)?.permissionMode || result.desktopPermissionMode;
+  printJson({ ok: !permission || permission.applied, executablePath, ...result, desktopPermissionMode: finalMode, permissionEnforcement: permission });
 }
 
 function syncClaudeCodeCredentialsFromDesktop(args = {}) {
@@ -2335,7 +2449,20 @@ function runLiveStdinHelper(parentPid, childPid, jsonLine, { dryRun = false } = 
 }
 
 function resolveLiveCodeProcess(session) {
-  const liveProcess = findLiveClaudeCodeProcessForSession(session);
+  const processes = listClaudeCodeCliProcesses();
+  let liveProcess = findLiveClaudeCodeProcessForSession(session, processes);
+  if (!liveProcess) {
+    // Newly initialized Desktop children receive their session through stdin,
+    // so --resume/--session-id need not appear on the process command line.
+    // Resolve them only through the exact registry identity and a live PID/start
+    // probe; never infer identity from creation time, model, or focus.
+    try {
+      const runtime = findPeerRuntime(session, processes);
+      liveProcess = runtimeVerifiedStdinProcess(session, processes, runtime, probePeer(runtime));
+    } catch {
+      liveProcess = null;
+    }
+  }
   if (!liveProcess) {
     throw new CliError(`No running Claude Desktop claude-code child found for cliSessionId ${session.cliSessionId}`);
   }
@@ -2345,6 +2472,21 @@ function resolveLiveCodeProcess(session) {
     throw new CliError("Could not resolve live Claude Desktop parent/child PIDs", 2, { liveProcess });
   }
   return { liveProcess, childPid, parentPid };
+}
+
+function runtimeVerifiedStdinProcess(session, processes, runtime, probe) {
+  if (!runtime || !probe || probe.ok !== true || probe.probe !== true ||
+      runtime.sessionId !== session.cliSessionId || probe.sessionId !== session.cliSessionId ||
+      probe.serverPid !== runtime.pid || probe.procStart !== runtime.procStart ||
+      !runtime.cwd || !session.cwd ||
+      path.win32.resolve(runtime.cwd).toLowerCase() !== path.win32.resolve(session.cwd).toLowerCase()) return null;
+  const matches = processes.filter((proc) => Number(proc.ProcessId || proc.processId) === runtime.pid);
+  if (matches.length !== 1) return null;
+  const commandLine = lower(matches[0].CommandLine || matches[0].commandLine);
+  if (/(?:^|\s)--(?:resume|session-id)(?:=|\s+)/.test(commandLine) ||
+      !/(?:^|\s)--input-format(?:=|\s+)stream-json(?:\s|$)/.test(commandLine) ||
+      !/(?:^|\s)--output-format(?:=|\s+)stream-json(?:\s|$)/.test(commandLine)) return null;
+  return matches[0];
 }
 
 const CLAUDE_PERMISSION_MODES = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
@@ -2369,15 +2511,10 @@ async function cmdSetPermissionMode(args, surface) {
     throw new CliError("code set-permission-mode requires an explicit --session-id");
   }
   const mode = String(args.mode || "");
-  const requestId = crypto.randomUUID();
-  const frame = buildPermissionModeControlFrame(mode, requestId);
+  buildPermissionModeControlFrame(mode);
   const session = resolveSession(surface, args);
-  const { liveProcess, childPid, parentPid } = resolveLiveCodeProcess(session);
-  const blocker = permissionModeLaunchBlocker(liveProcess.CommandLine || liveProcess.commandLine, mode);
-  if (blocker) throw new CliError(blocker, 2, { childPid });
   const dryRun = toBool(args["dry-run"]);
-  const helper = runLiveStdinHelper(parentPid, childPid, frame, { dryRun });
-  if (!helper.ok) throw new CliError("live-stdin helper failed to write the permission mode request", 2, helper);
+  const { requestId, parentPid, childPid, helper } = applyRuntimePermissionMode(session, mode, { dryRun });
   printJson({
     ok: true,
     dryRun,
@@ -2428,9 +2565,39 @@ async function codeLiveStdinAction(_args, surface, session, prompt) {
   };
 }
 
+function peerPermissionHoldRisk(senderMode, receiverMode) {
+  // Claude holds a cross-session message for its user's approval when the sender declares
+  // bypass but the receiving session runs in another mode. Such a message never reaches the
+  // transcript on its own, which looks like a missing session from the sender's side.
+  if (senderMode !== "bypass" || !receiverMode || receiverMode === "bypassPermissions") return null;
+  return `The receiving session runs in ${receiverMode}; Claude would hold a bypass sender's message for user approval. Switch it first with code set-permission-mode --mode bypassPermissions, or pass --allow-held.`;
+}
+
+async function wakeCodeSession(session, timeoutMs) {
+  const running = () => {
+    try { return findPeerRuntime(session, listClaudeCodeCliProcesses()); } catch { return null; }
+  };
+  const existing = running();
+  if (existing) return { woke: false, runtime: existing };
+  // Opening the session route makes Claude Desktop start its Claude Code process.
+  const via = openClaudeDeepLink(`claude://claude.ai/epitaxy/${encodeURIComponent(session.sessionId)}`);
+  const runtime = await waitForCondition(() => running(), timeoutMs).catch(() => null);
+  if (!runtime) throw new CliError(`Claude Desktop did not start a process for ${session.sessionId} after opening it`, 2, { via });
+  return { woke: true, via, runtime };
+}
+
+async function cmdWake(args, surface) {
+  if (surface !== "code" || !(args["session-id"] || args.sessionId)) throw new CliError("code wake requires an explicit --session-id");
+  const session = resolveSession(surface, args);
+  const result = await wakeCodeSession(session, toInt(args["timeout-ms"], 30000));
+  printJson({ ok: true, sessionId: session.sessionId, cliSessionId: session.cliSessionId, ...result });
+}
+
 async function codePeerAction(args, surface, session, prompt) {
   if (surface !== "code") throw new CliError("peer transport only supports Code sessions");
-  const runtime = findPeerRuntime(session, listClaudeCodeCliProcesses());
+  const holdRisk = peerPermissionHoldRisk(args["sender-mode"], session.permissionMode);
+  if (holdRisk && !toBool(args["allow-held"])) throw new CliError(holdRisk, 2, { receiverMode: session.permissionMode, delivery: "not-sent" });
+  const { runtime } = await wakeCodeSession(session, toInt(args["wake-timeout-ms"], 30000));
   const transcriptPath = codeTranscriptPath(session);
   let offset = 0;
   try { offset = fs.statSync(transcriptPath).size; } catch (error) { if (error.code !== "ENOENT") throw error; }
@@ -2893,6 +3060,19 @@ async function cmdWait(args, surface) {
 }
 
 async function cmdSelftest() {
+  assert(peerPermissionHoldRisk("bypass", "acceptEdits") !== null, "bypass sender to acceptEdits receiver is flagged as held");
+  assert(peerPermissionHoldRisk("bypass", "bypassPermissions") === null, "matching bypass modes are not flagged");
+  assert(peerPermissionHoldRisk("prompting", "acceptEdits") === null, "prompting sender is not flagged");
+  const createArgs = buildCreateCliArgs({ sessionId: "11111111-2222-4333-8444-555555555555", title: "디자인 리뷰", model: "claude-opus-5-5", effort: "high", permissionMode: "bypassPermissions" });
+  assert(createArgs.includes("--allow-dangerously-skip-permissions") && createArgs[createArgs.indexOf("--permission-mode") + 1] === "bypassPermissions", "create starts in bypass when requested");
+  assert(createArgs[createArgs.indexOf("--name") + 1] === "디자인 리뷰" && !createArgs.some((arg) => /Reply|READY/.test(arg)), "create passes the title as an argument and keeps the prompt off argv");
+  assert(!buildCreateCliArgs({ sessionId: "11111111-2222-4333-8444-555555555555", permissionMode: "default" }).includes("--allow-dangerously-skip-permissions"), "non-bypass create does not request skip permissions");
+  assert(resumeDeepLink("11111111-2222-4333-8444-555555555555") === "claude://resume?session=11111111-2222-4333-8444-555555555555", "resume deep link format");
+  assert(findImportedSession([{ sessionId: "local_a", cliSessionId: "x", mtimeMs: 1 }, { sessionId: "local_a", cliSessionId: "x", mtimeMs: 2 }], "x").mtimeMs === 2, "mirrored Desktop metadata copies resolve to one imported session");
+  let conflictingImport = false;
+  try { findImportedSession([{ sessionId: "local_a", cliSessionId: "x" }, { sessionId: "local_b", cliSessionId: "x" }], "x"); } catch { conflictingImport = true; }
+  assert(conflictingImport, "two Desktop sessions for one CLI session are rejected");
+  assert(selectDesktopInferenceToken({ "acct:a:b:https://api.anthropic.com:user:inference": { token: "t1", expiresAt: 2 }, "acct:a:b:https://api.anthropic.com:user:inference user:office": { token: "t2", expiresAt: 1 } }) === "t1", "newest inference token selected");
   const permissionFrame = JSON.parse(buildPermissionModeControlFrame("bypassPermissions", "request-1"));
   assert(permissionFrame.type === "control_request" && permissionFrame.request_id === "request-1", "permission frame is a control request");
   assert(permissionFrame.request.subtype === "set_permission_mode" && permissionFrame.request.mode === "bypassPermissions", "permission frame carries the requested mode");
@@ -2928,6 +3108,17 @@ async function cmdSelftest() {
   assert(findLiveClaudeCodeProcessForSession(initialSession, [identifiedChild]) === identifiedChild, "explicit initial session ID accepted");
   assert(findLiveClaudeCodeProcessForSession(initialSession, [resumedChild, { ...resumedChild, ProcessId: 124 }]) === null, "duplicate exact-session children rejected");
   assert(findLiveClaudeCodeProcessForSession(initialSession, [{ ...resumedChild, CommandLine: `${resumedChild.CommandLine} --session-id=other-session` }]) === null, "conflicting session IDs rejected");
+  const registrySession = { ...initialSession, cwd: "C:\\task" };
+  const registryRuntime = { sessionId: initialSession.cliSessionId, pid: 123, procStart: "123456", cwd: "C:\\task" };
+  const registryProbe = { ok: true, probe: true, sessionId: initialSession.cliSessionId, serverPid: 123, procStart: "123456" };
+  assert(runtimeVerifiedStdinProcess(registrySession, [initialChild], registryRuntime, registryProbe) === initialChild, "live registry probe resolves initialized child without command-line session ID");
+  assert(runtimeVerifiedStdinProcess(registrySession, [initialChild], registryRuntime, { ...registryProbe, serverPid: 124 }) === null, "different live PID rejected");
+  assert(runtimeVerifiedStdinProcess(registrySession, [initialChild], registryRuntime, { ...registryProbe, procStart: "654321" }) === null, "reused PID rejected");
+  assert(runtimeVerifiedStdinProcess(registrySession, [initialChild], registryRuntime, { ...registryProbe, sessionId: "other-session" }) === null, "different live session rejected");
+  assert(runtimeVerifiedStdinProcess(registrySession, [initialChild], { ...registryRuntime, cwd: "C:\\other" }, registryProbe) === null, "different checkout rejected");
+  assert(runtimeVerifiedStdinProcess(registrySession, [resumedChild], registryRuntime, registryProbe) === null, "registry path does not override explicit command-line identity");
+  assert(runtimeVerifiedStdinProcess(registrySession, [initialChild, initialChild], registryRuntime, registryProbe) === null, "ambiguous process inventory rejected");
+  assert(runtimeVerifiedStdinProcess(registrySession, [{ ...initialChild, CommandLine: "claude.exe" }], registryRuntime, registryProbe) === null, "non-streaming child rejected");
   const cwd = "C:\\Users\\USER\\Desktop\\Projects\\SEMI";
   const prompt = "hello";
   const codeStart = buildStartPayload("code", { cwd, title: "t" }, prompt);
@@ -3023,6 +3214,12 @@ async function main() {
       return;
     case "peer-receipt":
       await cmdPeerReceipt(args, surface);
+      return;
+    case "wake":
+      await cmdWake(args, surface);
+      return;
+    case "create":
+      await cmdCreate(args, surface, rest);
       return;
     case "set-permission-mode":
       await cmdSetPermissionMode(args, surface);

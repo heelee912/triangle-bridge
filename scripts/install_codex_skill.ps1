@@ -15,6 +15,7 @@ $files = @{
   'scripts\claude_live_stdin.ps1' = 'scripts\claude_live_stdin.ps1'
   'scripts\claude_peer_transport.mjs' = 'scripts\claude_peer_transport.mjs'
   'scripts\claude_peer_pipe.ps1' = 'scripts\claude_peer_pipe.ps1'
+  'scripts\claude_session_create.mjs' = 'scripts\claude_session_create.mjs'
   'scripts\codex_bridge.mjs' = 'scripts\codex_bridge.mjs'
   'scripts\codex_app_pipe.mjs' = 'scripts\codex_app_pipe.mjs'
 }
