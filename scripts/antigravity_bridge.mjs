@@ -106,7 +106,7 @@ export async function antigravityAction(input) {
   if (input.command === 'set-permission-mode') {
     const projectId = state.trajectory.metadata?.projectId;
     if (!projectId) throw new Error('This conversation has no project; Antigravity permission presets require a project');
-    if (input.scope !== 'project') throw new Error('Antigravity persists permissions per project. Pass --scope project explicitly');
+    if (input.scope !== undefined && input.scope !== 'project') throw new Error('Antigravity permission scope must be project');
     const p = (await call('readProject', { id: projectId })).project;
     if (!p || p.id !== projectId) throw new Error('Permission target project did not match');
     const settingsSchema = service.methods.find(m => m.localName === 'updateProject').input.fields.find(f => f.localName === 'project').message.fields.find(f => f.localName === 'settings').message;
@@ -115,8 +115,10 @@ export async function antigravityAction(input) {
       if (!value) throw new Error(`Native project setting unavailable: ${field}.${suffix}`);
       return value.number;
     };
-    const modes = { 'always-proceed': { sandboxMode: false, autoExecutionPolicy: settingEnum('autoExecutionPolicy', '_EAGER'), fileAccessPolicy: settingEnum('fileAccessPolicy', '_ALLOW'), permissionPreset: settingEnum('permissionPreset', '_TURBO') },
-      'request-review': { sandboxMode: false, autoExecutionPolicy: settingEnum('autoExecutionPolicy', '_OFF'), fileAccessPolicy: settingEnum('fileAccessPolicy', '_ASK'), permissionPreset: settingEnum('permissionPreset', '_REQUEST_REVIEW') } };
+    const modes = { 'always-proceed': { sandboxMode: false, autoExecutionPolicy: settingEnum('autoExecutionPolicy', '_EAGER'), fileAccessPolicy: settingEnum('fileAccessPolicy', '_ALLOW'),
+      internetPolicy: settingEnum('internetPolicy', '_ALLOW'), artifactReviewMode: settingEnum('artifactReviewMode', '_TURBO'), permissionPreset: settingEnum('permissionPreset', '_TURBO') },
+      'request-review': { sandboxMode: false, autoExecutionPolicy: settingEnum('autoExecutionPolicy', '_OFF'), fileAccessPolicy: settingEnum('fileAccessPolicy', '_ASK'),
+        internetPolicy: settingEnum('internetPolicy', '_ASK'), artifactReviewMode: settingEnum('artifactReviewMode', '_ALWAYS'), permissionPreset: settingEnum('permissionPreset', '_REQUEST_REVIEW') } };
     if (!modes[input.mode]) throw new Error('Mode must be always-proceed or request-review');
     await call('updateProject', { project: { ...p, settings: message(settingsSchema, { ...p.settings, ...modes[input.mode] }) } });
     const actual = (await call('readProject', { id: projectId })).project;
@@ -186,9 +188,9 @@ async function main() {
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) { const a = argv[i]; if (a.startsWith('--')) args[a.slice(2)] = argv[i + 1]?.startsWith('--') || !argv[i + 1] ? true : argv[++i]; else args._.push(a); }
   const command = args._[0] || 'status';
-  if (args.help) { console.log('Antigravity desktop: status | list [--cwd PATH] | create --cwd PATH [--title TEXT] [--prompt-file PATH] [--mode always-proceed|request-review --scope project] [--project-id ID] | send --session-id ID --prompt-file PATH [--wait] | read --session-id ID [--after-step N] [--request-id UUID] | set-permission-mode --session-id ID --scope project --mode always-proceed|request-review'); return; }
+  if (args.help) { console.log('Antigravity desktop: status | list [--cwd PATH] | create --cwd PATH [--title TEXT] [--prompt-file PATH] [--mode always-proceed|request-review] [--project-id ID] | send --session-id ID --prompt-file PATH [--wait] | read --session-id ID [--after-step N] [--request-id UUID] | set-permission-mode --session-id ID --mode always-proceed|request-review (project permissions)'); return; }
   if (args.mode && !['always-proceed', 'request-review'].includes(args.mode)) throw new Error('Mode must be always-proceed or request-review');
-  if (args.mode && args.scope !== 'project') throw new Error('Antigravity permissions require explicit --scope project');
+  if (args.scope !== undefined && args.scope !== 'project') throw new Error('Antigravity permission scope must be project');
   const input = { command, sessionId: args['session-id'], title: args.title, mode: args.mode, scope: args.scope, model: args.model,
     lines: Number(args.lines || 20), ...(args['after-step'] !== undefined ? { afterStep: Number(args['after-step']) } : {}),
     ...(args.cwd ? { workspaceUri: pathToFileURL(path.resolve(args.cwd)).href } : {}) };

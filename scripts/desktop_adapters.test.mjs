@@ -27,6 +27,8 @@ function antigravityFixture() {
   const settingsSchema = { typeName: 'Settings', fields: [
     field('sandboxMode'), field('securityPlugins'),
     field('fileAccessPolicy', { enum: enumeration([['POLICY_ALLOW', 1], ['POLICY_ASK', 2]]) }),
+    field('internetPolicy', { enum: enumeration([['INTERNET_ALLOW', 1], ['INTERNET_ASK', 2]]) }),
+    field('artifactReviewMode', { enum: enumeration([['REVIEW_TURBO', 2], ['REVIEW_ALWAYS', 1]]) }),
     field('autoExecutionPolicy', { enum: enumeration([['EXEC_EAGER', 3], ['EXEC_OFF', 1]]) }),
     field('permissionPreset', { enum: enumeration([['PRESET_TURBO', 3], ['PRESET_REQUEST_REVIEW', 2]]) }),
   ] };
@@ -91,10 +93,14 @@ test('Antigravity rebuilds typed settings and reads back project permissions', a
   const fixture = antigravityFixture();
   globalThis.window = fixture.window;
   try {
-    await assert.rejects(antigravityAction({ command: 'set-permission-mode', sessionId: 'exact', mode: 'always-proceed' }), /scope project/);
-    const result = await antigravityAction({ command: 'set-permission-mode', sessionId: 'exact', scope: 'project', mode: 'always-proceed' });
-    assert.equal(result.settings.permissionPreset, 3);
+    await assert.rejects(antigravityAction({ command: 'set-permission-mode', sessionId: 'exact', scope: 'session', mode: 'always-proceed' }), /scope must be project/);
+    assert.equal(fixture.calls.some(c => c.name === 'updateProject'), false);
+    const result = await antigravityAction({ command: 'set-permission-mode', sessionId: 'exact', mode: 'always-proceed' });
+    assert.equal(result.scope, 'project');
+    assert.deepEqual(result.settings, { sandboxMode: false, autoExecutionPolicy: 3, fileAccessPolicy: 1, internetPolicy: 1, artifactReviewMode: 2, permissionPreset: 3 });
     assert.deepEqual(fixture.calls.find(c => c.name === 'updateProject').request.project.settings.securityPlugins, { preserved: true });
+    const review = await antigravityAction({ command: 'set-permission-mode', sessionId: 'exact', mode: 'request-review' });
+    assert.deepEqual(review.settings, { sandboxMode: false, autoExecutionPolicy: 1, fileAccessPolicy: 2, internetPolicy: 2, artifactReviewMode: 1, permissionPreset: 2 });
   } finally { delete globalThis.window; }
 });
 

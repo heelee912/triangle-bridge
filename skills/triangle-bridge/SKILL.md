@@ -47,15 +47,15 @@ Explicit `--transport peer` is retained for native peer semantics; those meta in
 
 ```powershell
 node <skill>/scripts/antigravity_bridge.mjs list --cwd <project>
-node <skill>/scripts/antigravity_bridge.mjs create --cwd <project> --title <title> --mode always-proceed --scope project --prompt-file <utf8-file> --wait
+node <skill>/scripts/antigravity_bridge.mjs create --cwd <project> --title <title> --mode always-proceed --prompt-file <utf8-file> --wait
 node <skill>/scripts/antigravity_bridge.mjs send --session-id <exact-id> --prompt-file <utf8-file> --wait
 node <skill>/scripts/antigravity_bridge.mjs read --session-id <exact-id>
-node <skill>/scripts/antigravity_bridge.mjs set-permission-mode --session-id <exact-id> --scope project --mode always-proceed
+node <skill>/scripts/antigravity_bridge.mjs set-permission-mode --session-id <exact-id> --mode always-proceed
 ```
 
 Discovery reads the running native app's DevToolsActivePort, checks its native product identity, and uses the authenticated native language-server client and runtime protobuf descriptors. It does not start a browser or external model CLI. ID-based readback is checked before sending, and request tags select that input's response. The target model is inherited unless `--model` is explicit.
 
-Antigravity permissions persist per project, so **`--scope project` is required** and affects other conversations in that project. `always-proceed` selects the app's Turbo preset; `request-review` selects Request Review. A matching existing folder project is reused. Pass `--project-id <id>` if several projects share the folder. A conversation outside a project can send/read but cannot receive a project preset.
+Antigravity permissions persist per project and affect its other conversations. An explicit `--mode always-proceed` applies Turbo with execution, file and internet access allowed, sandbox disabled, and automatic artifact review; no extra scope flag is needed. `request-review` restores execution approval, file and internet prompts, and artifact review. A matching existing folder project is reused. Pass `--project-id <id>` if several projects share the folder. A conversation outside a project can send/read but cannot receive a project preset.
 
 ## Receipt and failure handling
 

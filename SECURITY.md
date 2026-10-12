@@ -8,7 +8,7 @@ Claude live stdin and native peer sends do not read OAuth credentials. Creating 
 
 Antigravity uses its existing loopback-only desktop endpoint and authenticated native client. It checks native app identity before calling session APIs. No debugger or browser is launched. Codex uses the current user's local native app pipes.
 
-Permission changes require explicit target IDs and are read back. Antigravity permission presets have project scope, which requires `--scope project`. Ordinary sends preserve permissions and models. The bridge does not restart or patch apps.
+Permission changes require explicit target IDs and are read back. Antigravity permission presets apply to the target conversation's project when a mode is explicitly requested. Ordinary sends preserve permissions and models. The bridge does not restart or patch apps.
 
 The local outbox records recipient IDs, request UUIDs, prompt hashes, and states; it stores neither prompt bodies nor inbox keys. Duplicate unconfirmed Claude and Antigravity inputs are blocked. Lost mutation acknowledgements are reported as unknown; inspect the exact target before making another attempt.
 

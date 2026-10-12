@@ -87,14 +87,14 @@ triangle-bridge antigravity read --session-id <antigravity-id> --request-id <req
 ```powershell
 triangle-bridge codex create --cwd "C:\Projects\Example" --title "Bridge task" --prompt-file .\message.txt --mode always-proceed
 triangle-bridge claude code create --cwd "C:\Projects\Example" --title "Bridge task" --prompt-file .\message.txt --permission-mode bypassPermissions --json
-triangle-bridge antigravity create --cwd "C:\Projects\Example" --title "Bridge task" --prompt-file .\message.txt --mode always-proceed --scope project --wait
+triangle-bridge antigravity create --cwd "C:\Projects\Example" --title "Bridge task" --prompt-file .\message.txt --mode always-proceed --wait
 ```
 
 | App | Creation | Approval scope |
 | --- | --- | --- |
 | Codex | Native `create_thread`; folder must be a registered local project | Exact thread; `always-proceed` or `request-review` |
 | Claude Desktop Code | Desktop's installed child binary initializes a fresh transcript; the native resume link imports it into Desktop and exact metadata confirms it | Exact Code session; `default`, `acceptEdits`, `plan`, `auto`, or `bypassPermissions` |
-| Antigravity | Native conversation creation; reuses the project matching the folder | **Entire project**, explicitly acknowledged by `--scope project`; Turbo or Request Review |
+| Antigravity | Native conversation creation; reuses the project matching the folder | Entire project; `always-proceed` or `request-review` |
 
 Codex creates an inert initial turn when `--mode` is requested, confirms the mode, then sends the task prompt. Claude uses the current Desktop sign-in for creation without writing a separate credential file. An imported bypass session is updated through the native runtime control and confirmed in Desktop metadata. If creation partially succeeds, retain its returned ID and recover that session instead of creating another.
 
@@ -106,10 +106,12 @@ For existing sessions:
 triangle-bridge codex set-permission-mode --thread <codex-id> --mode always-proceed
 triangle-bridge codex settings --thread <codex-id>
 triangle-bridge claude code set-permission-mode --session-id <claude-id> --mode bypassPermissions --json
-triangle-bridge antigravity set-permission-mode --session-id <antigravity-id> --mode always-proceed --scope project
+triangle-bridge antigravity set-permission-mode --session-id <antigravity-id> --mode always-proceed
 ```
 
 Approval changes use native app controls and verify readback. Ordinary message delivery does not change permissions. Claude can only switch to `bypassPermissions` when the Desktop child was launched with the corresponding allow/skip flag.
+
+Antigravity `always-proceed` applies Turbo with execution, file and internet access allowed, sandbox disabled, and automatic artifact review. `request-review` restores execution approval, file and internet prompts, and artifact review. A mode request applies directly to the conversation's project; no extra scope flag is needed.
 
 ## Native transports
 
