@@ -16,12 +16,12 @@ flowchart TD
 Requires **Windows** and **Node.js 22 or later**. Install and sign in to the desktop apps that will participate, and keep them running.
 
 ```powershell
-npm install --global git+https://github.com/heelee912/triangle-bridge.git
+npm install --global https://github.com/heelee912/triangle-bridge/archive/refs/heads/main.tar.gz
 triangle-bridge --help
 triangle-bridge status --cwd "C:\Projects\Example"
 ```
 
-Installation is through GitHub using npm. No npm registry publication is required for this command. There are no third-party runtime dependencies, API keys, personal checkout paths, or background bridge server to configure.
+Installation is through GitHub using npm, without requiring Git or GH CLI. No npm registry publication is required for this command. There are no third-party runtime dependencies, API keys, personal checkout paths, or background bridge server to configure.
 
 Install the same self-contained skill into all three apps:
 
@@ -129,7 +129,7 @@ npm test
 npm pack --dry-run
 ```
 
-The test suite covers exact session isolation, Unicode transport, unknown delivery, duplicate unconfirmed sends, visible Claude frames, native project discovery, protobuf model/settings serialization, and permission readback. Package contents exclude tests and local app state.
+The test suite covers exact session isolation, Unicode transport, unknown delivery, duplicate unconfirmed sends, visible Claude frames, native project discovery, protobuf model/settings serialization, and permission readback. `npm pack` excludes tests and local app state; the GitHub source archive also includes the development tests.
 
 The three apps were exercised in all six send/read directions on Windows, including new desktop sessions and approval readback. Tested versions: Codex 26.1007.2314.0, Claude Desktop 2.31226.1.0 (Code child 2.1.295), Antigravity 2.22.0. These native internal interfaces can change with app updates; errors are reported explicitly rather than switching to unrelated sessions.
 
