@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import { buildCreateCliArgs, createCodeSession, findImportedSession, resumeDeepLink } from "./claude_session_create.mjs";
 import { createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, peerReceipt, probePeer, reservePeerMessage, sendPeer, waitForPeerReceipt } from "./claude_peer_transport.mjs";
 import { buildVisibleUserFrame, chooseDesktopSendTransport } from './claude_visible_transport.mjs';
+import { ensureDesktopReady } from './desktop_lifecycle.mjs';
 
 const CODE_MODEL = "claude-opus-4-8";
 const CODE_EFFORT = "xhigh";
@@ -112,6 +113,7 @@ function routeCommand(args) {
 
 function usage() {
   return `Usage:
+  claude_code_bridge.mjs code app-start [--json]              Open the installed desktop app without restarting it.
   claude_code_bridge.mjs status [--cwd PATH] [--json]
   claude_code_bridge.mjs list [--cwd PATH] [--json]
   claude_code_bridge.mjs code start --prompt TEXT [--cwd PATH] [--title TEXT] [--wait]
@@ -142,6 +144,8 @@ Renderer transport:
   CLAUDE_MAIN_INSPECT_PORT or CLAUDE_MAIN_INSPECT_URL
 
 Bridge bootstrap:
+  Session create/send/read/permission commands automatically open an unavailable desktop app.
+  status/list stay passive unless --start-app is explicit.
   Mutating commands first try existing transports, then non-destructive attach attempts.
   --attach-only prevents bootstrap from launching another Claude Desktop instance.
   Use --restart-claude --yes to let the CLI restart Claude Desktop with --inspect.
@@ -3228,6 +3232,11 @@ function assert(condition, message) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const { surface, command, rest } = routeCommand(args);
+
+  if (command === 'app-start') { printJson({ ok: true, ...await ensureDesktopReady('claude') }); return; }
+  if (!toBool(args['dry-run']) && (toBool(args['start-app']) ||
+      ['create', 'read', 'wait', 'wake', 'send', 'set-permission-mode'].includes(command) &&
+      (command === 'create' || args['session-id'] || args.sessionId))) await ensureDesktopReady('claude');
 
   switch (command) {
     case "help":

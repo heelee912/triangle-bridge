@@ -10,6 +10,8 @@ Antigravity uses its existing loopback-only desktop endpoint and authenticated n
 
 Permission changes require explicit target IDs and are read back. Antigravity permission presets apply to the target conversation's project when a mode is explicitly requested. Ordinary sends preserve permissions and models. The bridge does not restart or patch apps.
 
+Session operations can launch the installed same-user desktop app or reopen its closed window. Installation paths come from the current Windows package manifest, standard installation locations and registered app paths. Startup waits for readiness before session mutations and never terminates a process, adds debugger flags or retries a message with unknown delivery. Passive discovery does not launch apps unless `--start-app` is explicit.
+
 The local outbox records recipient IDs, request UUIDs, prompt hashes, and states; it stores neither prompt bodies nor inbox keys. Duplicate unconfirmed Claude and Antigravity inputs are blocked. Lost mutation acknowledgements are reported as unknown; inspect the exact target before making another attempt.
 
 Before publication, run `npm run check`, `npm test`, and `npm pack --dry-run`. Inspect the staged source and package contents for actual credential values and personal data. Names such as `accessToken` in source are implementation variables, not published token values.

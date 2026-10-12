@@ -22,10 +22,22 @@ export function runAdapter(app, args, capture = false) {
 async function main() {
   const [command, ...args] = process.argv.slice(2);
   if (!command || ['help', '--help', '-h'].includes(command)) {
-    console.log('Triangle Bridge — Codex, Claude Desktop Code, Antigravity\n\ntriangle-bridge status [--cwd PATH]\ntriangle-bridge install-skills\ntriangle-bridge codex <command> [options]\ntriangle-bridge claude code <command> [options]\ntriangle-bridge antigravity <command> [options]\n\nPass --help after an app name for its commands. Requires Node.js 22+ and running desktop apps on Windows.');
+    console.log('Triangle Bridge — Codex, Claude Desktop Code, Antigravity\n\ntriangle-bridge status [--cwd PATH] [--start-app]\ntriangle-bridge start [codex|claude|antigravity]\ntriangle-bridge install-skills\ntriangle-bridge codex <command> [options]\ntriangle-bridge claude code <command> [options]\ntriangle-bridge antigravity <command> [options]\n\nPass --help after an app name for its commands. Requires Node.js 22+ and installed, signed-in desktop apps on Windows. Session operations open unavailable apps automatically without stopping or restarting running apps.');
     return;
   }
   if (command === 'install-skills') { console.log(JSON.stringify(installSkills(), null, 2)); return; }
+  if (command === 'start') {
+    const selected = args[0] ? [args[0]] : Object.keys(adapters);
+    if (selected.some(app => !adapters[app])) throw new Error('start accepts codex, claude or antigravity');
+    const results = [];
+    for (const app of selected) {
+      const { result } = await runAdapter(app, app === 'claude' ? ['code', 'app-start', '--json'] : ['app-start'], true);
+      results.push({ app, ...result });
+    }
+    console.log(JSON.stringify({ ok: results.every(r => r.ok), apps: results }, null, 2));
+    if (results.some(r => !r.ok)) process.exitCode = 1;
+    return;
+  }
   if (command === 'status') {
     const results = await Promise.all(Object.keys(adapters).map(async app => {
       const commands = app === 'claude' ? ['code', 'list', '--json'] : ['list'];

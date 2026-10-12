@@ -2,6 +2,7 @@
 import net from 'node:net';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { ensureDesktopReady } from './desktop_lifecycle.mjs';
 
 export function encodeFrame(value) {
   const body = Buffer.from(JSON.stringify(value), 'utf8');
@@ -135,15 +136,35 @@ export function projectPublishedReply(snapshot, threadId, hostId, filter) {
     ...(message.phase ? { phase: message.phase } : {}), text: message.text } };
 }
 
-export async function openAppTools(threadId, { timeoutMs = 15000, endpoints, callerThreadId = threadId, hostId, replyFilter } = {}) {
+function desktopPipeEndpoints() {
+  if (process.platform !== 'win32') throw new Error('App-tool pipe discovery currently requires Windows');
+  return fs.readdirSync('\\\\.\\pipe\\')
+    .filter(name => /^codex-browser-use(?:-|[\\/])[0-9a-f-]{36}$/i.test(name))
+    .map(name => '\\\\.\\pipe\\' + name);
+}
+
+export async function ensureCodexDesktop() {
+  return ensureDesktopReady('codex', { probe: async () => {
+    for (const endpoint of desktopPipeEndpoints()) {
+      const pipe = new AppToolPipe(endpoint, { timeoutMs: 1000 });
+      try {
+        await pipe.connect();
+        const catalog = await pipe.request('tools/list');
+        if (['read_thread', 'send_message_to_thread'].every(name => catalog?.tools?.some(t => t.namespace === 'codex_app' && t.name === name))) return { endpoint };
+      } catch { /* A stale endpoint is not ready. */ }
+      finally { pipe.close(); }
+    }
+    return null;
+  } });
+}
+
+export async function openAppTools(threadId, { timeoutMs = 15000, endpoints, callerThreadId = threadId, hostId, replyFilter, autoStart = true } = {}) {
   if (replyFilter && (!hostId || typeof replyFilter.tag !== 'string' || !replyFilter.tag.trim() || /[\r\n]/.test(replyFilter.tag))) {
     throw new Error('Reply-only reads require an exact host and a nonempty single-line reply tag');
   }
   if (!endpoints) {
-    if (process.platform !== 'win32') throw new Error('App-tool pipe discovery currently requires Windows');
-    endpoints = fs.readdirSync('\\\\.\\pipe\\')
-      .filter(name => /^codex-browser-use(?:-|[\\/])[0-9a-f-]{36}$/i.test(name))
-      .map(name => '\\\\.\\pipe\\' + name);
+    if (autoStart) await ensureCodexDesktop();
+    endpoints = desktopPipeEndpoints();
   }
   const failures = [];
   // Only read-only probes may try multiple endpoints. Never replay a send.

@@ -4,6 +4,7 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { evaluateDesktop } from './desktop_rpc.mjs';
+import { ensureDesktopReady } from './desktop_lifecycle.mjs';
 import { loadPrompt } from './codex_app_pipe.mjs';
 import { reservePeerMessage, markPeerMessage, findPeerMessageRecord } from './claude_peer_transport.mjs';
 
@@ -12,10 +13,12 @@ export async function discoverAntigravity(profile = path.join(process.env.APPDAT
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid Antigravity desktop port');
   const targets = await fetch(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(5000) }).then(r => r.json());
   const candidates = targets.filter(t => t.type === 'page' && /^https:\/\/127\.0\.0\.1:\d+\//.test(t.url) && /Antigravity$/.test(t.title));
-  if (candidates.length !== 1) throw new Error(`Expected one Antigravity desktop surface; found ${candidates.length}`);
+  if (candidates.length !== 1) throw Object.assign(new Error(`Expected one Antigravity desktop surface; found ${candidates.length}`), { desktopIdentityMismatch: candidates.length > 1 });
   const target = candidates[0];
-  const identity = await evaluateDesktop(target.webSocketDebuggerUrl, '({native:typeof window.nativeStorage?.getItems === "function", product:window.__APP_CONFIG__?.productName, version:window.__APP_CONFIG__?.appVersion})');
-  if (!identity.native || !/antigravity/i.test(identity.product || '')) throw new Error('Endpoint is not the Antigravity desktop app');
+  const identity = await evaluateDesktop(target.webSocketDebuggerUrl, '({native:typeof window.nativeStorage?.getItems === "function", product:window.__APP_CONFIG__?.productName, version:window.__APP_CONFIG__?.appVersion, ready:Object.values(window).some(v=>v?.lsClient && typeof v.lsClient.startCascade === "function")})');
+  if (!identity.native || !identity.product) throw new Error('Antigravity desktop identity is not ready');
+  if (!/antigravity/i.test(identity.product)) throw Object.assign(new Error('Endpoint is not the Antigravity desktop app'), { desktopIdentityMismatch: true });
+  if (!identity.ready) throw new Error('Antigravity native session client is not ready');
   return { ...target, version: identity.version };
 }
 
@@ -150,7 +153,11 @@ export async function antigravityAction(input) {
 }
 
 export async function runAntigravity(input, options = {}) {
-  const target = await discoverAntigravity(options.profile);
+  const startup = ['status', 'list'].includes(input.command) && !options.startApp ?
+    { started: false, ready: await discoverAntigravity(options.profile) } :
+    await ensureDesktopReady('antigravity', { probe: () => discoverAntigravity(options.profile), timeoutMs: options.startupTimeoutMs || 45000 });
+  const target = startup.ready;
+  if (input.command === 'app-start') return { ok: true, app: 'antigravity', version: target.version, started: startup.started, ready: true };
   let reservation;
   if (input.command === 'send') {
     if (!input.sessionId || typeof input.prompt !== 'string' || !input.prompt.trim()) throw new Error('Send requires an exact session and nonempty prompt');
@@ -188,7 +195,7 @@ async function main() {
   const argv = process.argv.slice(2);
   for (let i = 0; i < argv.length; i++) { const a = argv[i]; if (a.startsWith('--')) args[a.slice(2)] = argv[i + 1]?.startsWith('--') || !argv[i + 1] ? true : argv[++i]; else args._.push(a); }
   const command = args._[0] || 'status';
-  if (args.help) { console.log('Antigravity desktop: status | list [--cwd PATH] | create --cwd PATH [--title TEXT] [--prompt-file PATH] [--mode always-proceed|request-review] [--project-id ID] | send --session-id ID --prompt-file PATH [--wait] | read --session-id ID [--after-step N] [--request-id UUID] | set-permission-mode --session-id ID --mode always-proceed|request-review (project permissions)'); return; }
+  if (args.help) { console.log('Antigravity desktop: app-start | status [--start-app] | list [--cwd PATH] [--start-app] | create --cwd PATH [--title TEXT] [--prompt-file PATH] [--mode always-proceed|request-review] [--project-id ID] | send --session-id ID --prompt-file PATH [--wait] | read --session-id ID [--after-step N] [--request-id UUID] | set-permission-mode --session-id ID --mode always-proceed|request-review (project permissions). Session operations open the installed desktop app automatically if unavailable.'); return; }
   if (args.mode && !['always-proceed', 'request-review'].includes(args.mode)) throw new Error('Mode must be always-proceed or request-review');
   if (args.scope !== undefined && args.scope !== 'project') throw new Error('Antigravity permission scope must be project');
   const input = { command, sessionId: args['session-id'], title: args.title, mode: args.mode, scope: args.scope, model: args.model,
@@ -203,7 +210,7 @@ async function main() {
   }
   const prompt = command === 'send' || command === 'create' && (args.prompt || args['prompt-file']) ? loadPrompt(args) : undefined;
   let result = await runAntigravity({ ...input, ...(command === 'send' ? { prompt } : {}),
-    ...(command === 'read' && args['request-id'] ? { afterStep: 0 } : {}) }).catch(error => {
+    ...(command === 'read' && args['request-id'] ? { afterStep: 0 } : {}) }, { startApp: !!args['start-app'] }).catch(error => {
       if (command === 'create') { error.sessionId = input.sessionId; error.projectId = input.projectId || input.newProjectId; }
       throw error;
     });

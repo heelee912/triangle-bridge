@@ -13,7 +13,7 @@ flowchart TD
 
 ## Install
 
-Requires **Windows** and **Node.js 22 or later**. Install and sign in to the desktop apps that will participate, and keep them running.
+Requires **Windows** and **Node.js 22 or later**. Install and sign in to the desktop apps that will participate. Session operations open an unavailable desktop app automatically and wait for readiness before contacting the exact session.
 
 ```powershell
 npm install --global https://github.com/heelee912/triangle-bridge/archive/refs/heads/main.tar.gz
@@ -40,6 +40,17 @@ Invoke `triangle-bridge` as a skill in a session after the app refreshes its ski
 ## Commands
 
 Use the target app name after `triangle-bridge`. A standalone `codex-bridge`, `claude-code-bridge`, and `antigravity-bridge` command is also installed.
+
+Open all three desktop apps, or one target app:
+
+```powershell
+triangle-bridge start
+triangle-bridge start antigravity
+```
+
+Creation, sending, reading and permission changes automatically open unavailable apps. An already ready app is reused. A closed Antigravity window can be reopened while its background process remains running. Startup never stops or restarts a running app, adds debugger flags, or changes the sign-in, model or permissions. If startup cannot establish readiness, the session operation fails before sending and is not replayed.
+
+`status` and `list` remain passive by default. Use `triangle-bridge status --start-app` to open unavailable apps during discovery. Each adapter also accepts `app-start` (`triangle-bridge claude code app-start --json` for Claude). Claude's existing `code start` command creates a session and is separate from desktop startup.
 
 ### Discover and select a session
 

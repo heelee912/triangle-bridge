@@ -29,7 +29,7 @@ import os from "node:os";
 import path from "node:path";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { openAppTools, toolParams, decodeToolResult, loadPrompt } from './codex_app_pipe.mjs';
+import { openAppTools, toolParams, decodeToolResult, loadPrompt, ensureCodexDesktop } from './codex_app_pipe.mjs';
 import { setDesktopPermissions, readDesktopSettings, permissionSettings } from './codex_desktop_settings.mjs';
 
 const PIPE = process.platform === "win32"
@@ -293,8 +293,15 @@ async function main() {
       'create --context-thread <caller ID> --cwd <registered project path> --prompt-file <UTF-8 file> [--title TEXT] [--mode always-proceed]',
       'set-permission-mode --thread <exact ID> --mode always-proceed|request-review',
       'settings --thread <exact ID>',
+      'app-start (open the installed desktop app if its native connection is unavailable)',
     ], transport: 'Standalone local Codex app tool pipe; no OmniCodex dependency',
       delivery: 'Send returns the native acknowledgement; read distinguishes queued input from a completed reply. Unknown delivery is not automatically retried.' });
+    return;
+  }
+
+  if (cmd === 'app-start') {
+    try { out({ ok: true, ...await ensureCodexDesktop() }); }
+    catch (error) { out({ ok: false, error: error.message }); process.exitCode = 1; }
     return;
   }
 
@@ -308,7 +315,7 @@ async function main() {
         (['list', 'create'].includes(cmd) ? knownDesktop.openThreadIds[0] || Object.keys(knownDesktop.threadRootHints)[0] : undefined);
       if (!context) throw new Error('Pass --context-thread <known Codex desktop ID> for discovery or creation');
       const ready = await openAppTools(['settings', 'set-permission-mode'].includes(cmd) ? args.thread : context,
-        { callerThreadId: context, hostId: args['host-id'] });
+        { callerThreadId: context, hostId: args['host-id'], autoStart: cmd !== 'list' || !!args['start-app'] });
       pipe = ready.pipe;
       const call = async (name, payload, mutation = false) => decodeToolResult(await pipe.request('tools/call', toolParams(context, name, payload), { mutation, timeoutMs: 60000 }));
       if (cmd === 'list') {
@@ -380,7 +387,7 @@ async function main() {
       const prompt = cmd === 'send' ? loadPrompt(args) : undefined;
       const replyFilter = cmd === 'reply' ? { tag: args['reply-tag'], afterCursor: args['after-cursor'],
         messageId: args['message-id'], turnId: args['turn-id'] } : undefined;
-      const ready = await openAppTools(conversationId, { callerThreadId, hostId, replyFilter });
+      const ready = await openAppTools(conversationId, { callerThreadId, hostId, replyFilter, autoStart: cmd !== 'status' || !!args['start-app'] });
       pipe = ready.pipe;
       if (cmd === 'reply') {
         out({ ok: true, conversationId, hostId, ...ready.reply });

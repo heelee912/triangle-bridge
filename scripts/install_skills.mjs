@@ -8,7 +8,7 @@ const root = fileURLToPath(new URL('../', import.meta.url));
 const resources = [
   'claude_code_bridge.mjs', 'claude_live_stdin.ps1', 'claude_peer_transport.mjs', 'claude_peer_pipe.ps1',
   'claude_session_create.mjs', 'claude_visible_transport.mjs', 'codex_bridge.mjs', 'codex_app_pipe.mjs',
-  'codex_desktop_settings.mjs', 'antigravity_bridge.mjs', 'desktop_rpc.mjs',
+  'codex_desktop_settings.mjs', 'antigravity_bridge.mjs', 'desktop_rpc.mjs', 'desktop_lifecycle.mjs',
 ];
 
 export function installSkills({ home = os.homedir(), codexHome = process.env.CODEX_HOME || path.join(home, '.codex') } = {}) {

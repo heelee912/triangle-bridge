@@ -7,6 +7,42 @@ import os from 'node:os';
 import path from 'node:path';
 import { buildVisibleUserFrame, chooseDesktopSendTransport } from './claude_visible_transport.mjs';
 import { permissionSettings, setDesktopPermissions } from './codex_desktop_settings.mjs';
+import { ensureDesktopReady } from './desktop_lifecycle.mjs';
+
+for (const app of ['codex', 'claude', 'antigravity']) {
+  test(`${app} reuses a ready desktop app without launching it`, async () => {
+    const running = { pids: [1234] };
+    const result = await ensureDesktopReady(app, { probe: async () => running,
+      launch: async () => assert.fail('Ready apps must never be launched or restarted') });
+    assert.equal(result.started, false);
+    assert.equal(result.ready, running);
+  });
+  test(`${app} starts once and waits for readiness before returning`, async () => {
+    let probes = 0, launches = 0;
+    const events = [];
+    const result = await ensureDesktopReady(app, { intervalMs: 0,
+      probe: async () => { events.push('probe'); return ++probes < 3 ? null : { pids: [4321] }; },
+      launch: async target => { assert.equal(target, app); launches++; events.push('launch'); return { action: 'launch' }; } });
+    assert.equal(launches, 1);
+    assert.equal(result.started, true);
+    assert.deepEqual(events, ['probe', 'launch', 'probe', 'probe']);
+  });
+}
+
+test('desktop startup times out without relaunching or replaying a session mutation', async () => {
+  let clock = 0, launches = 0;
+  await assert.rejects(ensureDesktopReady('antigravity', { timeoutMs: 10, intervalMs: 5, now: () => clock,
+    sleep: async ms => { clock += ms; }, probe: async () => { throw new Error('native client unavailable'); },
+    launch: async () => { launches++; } }), /did not become ready.*native client unavailable/);
+  assert.equal(launches, 1);
+});
+
+test('a different or ambiguous desktop identity never triggers a launch', async () => {
+  await assert.rejects(ensureDesktopReady('antigravity', {
+    probe: async () => { throw Object.assign(new Error('wrong desktop'), { desktopIdentityMismatch: true }); },
+    launch: async () => assert.fail('Identity mismatch must not trigger startup'),
+  }), /wrong desktop/);
+});
 
 test('Claude ordinary input preserves Unicode and the receipt UUID without hidden meta fields', () => {
   const frame = JSON.parse(buildVisibleUserFrame('exact-session', '주인님\n화면 표시 테스트', 'request-uuid'));
@@ -151,7 +187,7 @@ test('skill installation copies all runtime dependencies to arbitrary homes and 
   assert.equal(result.destinations.length, 3);
   for (const root of result.destinations) {
     assert.match(fs.readFileSync(path.join(root, 'SKILL.md'), 'utf8'), /name: triangle-bridge/);
-    for (const module of ['antigravity_bridge.mjs', 'desktop_rpc.mjs', 'claude_visible_transport.mjs', 'codex_desktop_settings.mjs'])
+    for (const module of ['antigravity_bridge.mjs', 'desktop_rpc.mjs', 'claude_visible_transport.mjs', 'codex_desktop_settings.mjs', 'desktop_lifecycle.mjs'])
       assert.equal(fs.existsSync(path.join(root, 'scripts', module)), true);
   }
   const untouched = path.join(result.destinations[0], 'custom.txt');
