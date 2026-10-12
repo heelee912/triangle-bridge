@@ -1,0 +1,7 @@
+interface:
+  display_name: "Triangle Bridge"
+  short_description: "Connect exact Codex, Claude and Antigravity desktop sessions"
+  default_prompt: "Use $triangle-bridge to communicate with the specified desktop session and confirm its response."
+
+policy:
+  allow_implicit_invocation: true

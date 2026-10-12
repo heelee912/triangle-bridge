@@ -1,138 +1,136 @@
-# Claude Codex Bridge
+# Triangle Bridge
 
-Local bidirectional bridge experiments between the Claude Desktop app and the Codex desktop app.
+Connect **Codex**, **Claude Desktop Code**, and **Antigravity (Gemini)** desktop sessions from any of the three apps.
 
-This repository contains two independent directions:
+Three target adapters provide session discovery, exact ID routing, creation, approval settings, message delivery, and response reading. The sending model uses the same codebase in every direction.
 
-- `scripts/codex_bridge.mjs`: Claude-to-Codex. Calls the running Codex app's native thread tools through a standalone local named-pipe client.
-- `scripts/claude_code_bridge.mjs`: Codex-to-Claude. Uses renderer/raw LocalSessions APIs, the session-specific peer inbox, or a verified live stdin pipe.
-
-It does not patch Claude Desktop, Codex, `app.asar`, WindowsApps copies, browser state, or UI controls.
-
-## Claude to Codex
-
-The default transport discovers the running Codex app's native tool pipe:
-
-```text
-\\.\pipe\codex-browser-use-<instance-id>
+```mermaid
+flowchart TD
+    Codex <--> Claude[Claude Desktop Code]
+    Claude <--> Antigravity[Antigravity / Gemini]
+    Antigravity <--> Codex
 ```
 
-It uses length-prefixed JSON-RPC:
+## Install
 
-```text
-[uint32 little-endian byteLength][utf8 JSON]
-```
-
-The send path is:
-
-```text
-tools/list -> read_thread (exact target check) -> send_message_to_thread
-```
-
-The target does **not** have to be the visible or focused thread. The app's native send function resumes the specified thread by ID and coordinates active-turn steering or a new turn. Viewing another thread does not change the target. Codex desktop must remain running and its native tool endpoint must be responsive.
-
-This implementation has no OmniCodex imports, MCP connection, shared queue, server or configuration dependency. It does not start a separate Codex app-server or alter the target's model settings. Windows pipe discovery is currently supported.
-
-Example:
+Requires **Windows** and **Node.js 22 or later**. Install and sign in to the desktop apps that will participate, and keep them running.
 
 ```powershell
-node .\scripts\codex_bridge.mjs status --thread <thread-id>
-node .\scripts\codex_bridge.mjs send --thread <thread-id> --prompt-file .\message.txt
-node .\scripts\codex_bridge.mjs read --thread <thread-id> --turn-limit 2
-node .\scripts\codex_bridge.mjs --help
+npm install --global git+https://github.com/heelee912/triangle-bridge.git
+triangle-bridge --help
+triangle-bridge status --cwd "C:\Projects\Example"
 ```
 
-Use a UTF-8 file for Korean or multiline messages. `--conversation-id` remains an alias for `--thread`. Send and read require an explicit ID or an unambiguous `--name`; they do not guess the newest conversation.
+Installation is through GitHub using npm. No npm registry publication is required for this command. There are no third-party runtime dependencies, API keys, personal checkout paths, or background bridge server to configure.
 
-`delivery: "app-acknowledged"` means the native send returned the intended thread ID. It does not mean the recipient has completed a reply. A lost acknowledgement is reported as `delivery: "unknown"` and is never automatically resent. Read the target before retrying.
-
-The old `codex-ipc` owner-window protocol is retained only for explicit `--transport ipc` and `raw` diagnostics. It is not the default send path and is not an automatic fallback.
-
-Version 0.2.0 was verified with an actual Claude-originated message received by Codex 26.924.2738.0 while the target turn was active. Foreground independence was checked against the installed app's ID-based resume/send implementation; a separate UI-switch experiment was not performed.
-
-## Codex to Claude
-
-The preferred Claude Desktop API surfaces are:
-
-- Code: `window["claude.web"].LocalSessions`
-- Cowork: `window["claude.web"].LocalAgentModeSessions`
-- Raw eIPC: Electron main process handler registry entries ending in `LocalSessions_$_...` or `LocalAgentModeSessions_$_...`
-
-When renderer/raw bridges are unavailable but Claude Desktop already has a running Code child process, the `live-stdin` transport writes a Claude Code stream-json user frame into the app-owned stdin pipe for that child process:
-
-```json
-{"type":"user","message":{"role":"user","content":"message"}}
-```
-
-Example:
+Install the same self-contained skill into all three apps:
 
 ```powershell
-node .\scripts\claude_code_bridge.mjs status --cwd "C:\path\to\project" --json
-node .\scripts\claude_code_bridge.mjs code peer-probe --session-id <cli-or-desktop-session-id> --json
-node .\scripts\claude_code_bridge.mjs code send --session-id <cli-or-desktop-session-id> --transport peer --sender-mode <actual-sender-mode> --sender-session-id <sender-session-id> --prompt-file .\prompt.txt --wait --json
-node .\scripts\claude_code_bridge.mjs code send --session-id <desktop-session-id> --transport live-stdin --prompt-file .\prompt.txt --wait
+triangle-bridge install-skills
 ```
 
-Automatic Code send transport order:
+The installer derives the current user's home and writes only the packaged skill resources:
 
-```text
-renderer -> raw -> peer -> live-stdin
-```
+- Codex: `$CODEX_HOME/skills/triangle-bridge`, or `~/.codex/skills/triangle-bridge`.
+- Claude Desktop Code: `~/.claude/skills/triangle-bridge`.
+- Antigravity: `~/.gemini/config/skills/triangle-bridge`.
 
-`live-stdin` requires a matching already-running Claude Desktop `claude-code --resume <cliSessionId>` child process. The Claude app does not need to have that window focused, but the child process must be alive.
+Invoke `triangle-bridge` as a skill in a session after the app refreshes its skill list. Bundled scripts work independently of the original Git checkout and npm install location. Repeating the installer updates its own listed files and preserves unrelated files.
 
-Every send requires an explicit session ID. Both the Desktop `local_...` ID and its exact CLI session ID are accepted. Unknown or ambiguous IDs fail before sending; focus and recency never choose a recipient. A CLI resume fallback requires explicit user approval and `--allow-cli-fallback` or `--transport cli`.
+## Commands
 
-The peer path resolves Claude's `.claude/sessions/<pid>.json` runtime record. It checks the session, checkout, protocol and process start time, then verifies the connected named-pipe server PID. This identifies newly started Desktop children that have no `--resume` argument. The local inbox key is read only for the intended pipe connection; OAuth credentials and Claude model or permission settings are not changed.
+Use the target app name after `triangle-bridge`. A standalone `codex-bridge`, `claude-code-bridge`, and `antigravity-bridge` command is also installed.
 
-Claude can hold a peer message when the sender permission mode is unknown or differs from the receiver. Declare the required `--sender-mode bypass|prompting --sender-session-id <actual-sender-session-id>` using the sender's actual permissions. The bridge uses Claude's canonical permission-parity envelope. It never assumes bypass permissions or changes the recipient's approval policy.
-
-`written-unconfirmed` proves only a pipe write. `--wait` requires the matching request UUID in the intended transcript and a descendant assistant reply. A timeout is `unknown` or `transcript-confirmed-awaiting-reply`; never resend an uncertain request. An assistant text entry can precede tool completion, so inspect the final reply or the return message before claiming the requested work finished.
-The local outbox at `~/.claude-codex-bridge/peer-outbox` records request IDs and states before writing. It refuses duplicate unconfirmed prompts to the same recipient across separate bridge invocations. It stores neither prompt bodies nor inbox keys. The shared home path avoids per-app Windows Store `LOCALAPPDATA` virtualization. Previous records are retained and consulted when needed.
-Receipt polling reads only transcript bytes appended since the send began, and stops at a later human or peer turn. To confirm a delayed receipt or a send without `--wait`, run `code peer-receipt --session-id ID --message-id UUID --json`. This reads the exact target transcript, updates a matching outbox record and never resends the request. Windows locking uses an exclusive named-pipe reservation that the OS releases on process exit, not persistent lock files.
-
-`raw probe` is observation-only unless `--bootstrap` is explicit. `--attach-only` prevents bootstrap from launching another app instance; restart requires `--restart-claude --yes`.
-
-## Global Codex Skill
-
-Install or update the self-contained global skill:
+### Discover and select a session
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install_codex_skill.ps1
+triangle-bridge status --cwd "C:\Projects\Example"
+triangle-bridge codex list --cwd "C:\Projects\Example"
+triangle-bridge claude code list --cwd "C:\Projects\Example" --json
+triangle-bridge antigravity list --cwd "C:\Projects\Example"
 ```
 
-This installs `$claude-code-bridge` under `$CODEX_HOME/skills`, or `~/.codex/skills` by default. Future Codex sessions can invoke the skill directly without a repository link. It includes both communication directions. The installer updates only its listed bridge resources and preserves other files already in the skill folder.
+Use the returned exact session ID for sends and reads. The bridge checks the target before sending and does not select the focused or newest recipient. If an app or its native endpoint is unavailable, status reports that app's error while returning the other app results.
 
-For long or non-ASCII prompts, prefer `--prompt-file`. Windows command-line argument length is limited, and Windows PowerShell text stdin can reinterpret UTF-8 through the active codepage. The bridge avoids both issues internally for `live-stdin` by passing a Base64-encoded UTF-8 stream-json frame to the PowerShell helper over stdin instead of a `-JsonLine` argument.
+Codex discovery uses an existing Desktop-known thread as a read-only caller context. Supply `--context-thread <known-local-desktop-id>` explicitly if discovery cannot resolve one. This context is not a message recipient and does not start a model turn.
 
-## Security Notes
+### Send and read
 
-No API keys or account tokens are embedded in this repository.
+Save the message in a UTF-8 file, such as `message.txt`:
 
-The CLI resume fallback can read Claude Desktop's local OAuth cache and sync Claude Code credentials on the local machine. That behavior is runtime-only and writes only to the user's local `~/.claude/.credentials.json`; it does not place credentials in this repository.
-It is not used automatically and requires explicit user approval.
+```powershell
+triangle-bridge codex send --thread <codex-id> --prompt-file .\message.txt
+triangle-bridge codex read --thread <codex-id> --turn-limit 2
 
-Before publishing changes, run:
+triangle-bridge claude code send --session-id <claude-id> --prompt-file .\message.txt --wait --json
+triangle-bridge claude code read --session-id <claude-id> --lines 10 --json
+
+triangle-bridge antigravity send --session-id <antigravity-id> --prompt-file .\message.txt --wait
+triangle-bridge antigravity read --session-id <antigravity-id>
+```
+
+Claude accepts its exact Desktop `local_…` ID or the corresponding internal session ID. Normal sends use visible ordinary user inputs, including the app-owned stream-json path when the renderer API is unavailable. The target model and approval mode are preserved.
+
+Antigravity attaches a request UUID to each input and selects its matching response. `--model <native-model-id-or-label>` is optional; the existing selected model is used otherwise.
+
+`app-acknowledged` and `written-unconfirmed` mean acceptance or a pipe write. Read the response before claiming completed work. Claude `--wait` confirms a matching assistant text entry, which may precede completion of tools. Antigravity `reply-complete` confirms the tagged input's response after the session becomes idle.
+
+A lost acknowledgement is `unknown` and is never automatically resent. The local outbox records IDs, hashes, and states without storing prompt text. Reconcile the existing request:
+
+```powershell
+triangle-bridge claude code peer-receipt --session-id <claude-id> --message-id <request-uuid> --json
+triangle-bridge antigravity read --session-id <antigravity-id> --request-id <request-uuid>
+```
+
+### Create a desktop session and assign approvals
+
+```powershell
+triangle-bridge codex create --cwd "C:\Projects\Example" --title "Bridge task" --prompt-file .\message.txt --mode always-proceed
+triangle-bridge claude code create --cwd "C:\Projects\Example" --title "Bridge task" --prompt-file .\message.txt --permission-mode bypassPermissions --json
+triangle-bridge antigravity create --cwd "C:\Projects\Example" --title "Bridge task" --prompt-file .\message.txt --mode always-proceed --scope project --wait
+```
+
+| App | Creation | Approval scope |
+| --- | --- | --- |
+| Codex | Native `create_thread`; folder must be a registered local project | Exact thread; `always-proceed` or `request-review` |
+| Claude Desktop Code | Desktop's installed child binary initializes a fresh transcript; the native resume link imports it into Desktop and exact metadata confirms it | Exact Code session; `default`, `acceptEdits`, `plan`, `auto`, or `bypassPermissions` |
+| Antigravity | Native conversation creation; reuses the project matching the folder | **Entire project**, explicitly acknowledged by `--scope project`; Turbo or Request Review |
+
+Codex creates an inert initial turn when `--mode` is requested, confirms the mode, then sends the task prompt. Claude uses the current Desktop sign-in for creation without writing a separate credential file. An imported bypass session is updated through the native runtime control and confirmed in Desktop metadata. If creation partially succeeds, retain its returned ID and recover that session instead of creating another.
+
+Antigravity permissions persist per project and affect its other conversations. A conversation outside a project can send/read, but cannot take a project approval preset. If multiple projects use a folder, pass the exact `--project-id` during creation.
+
+For existing sessions:
+
+```powershell
+triangle-bridge codex set-permission-mode --thread <codex-id> --mode always-proceed
+triangle-bridge codex settings --thread <codex-id>
+triangle-bridge claude code set-permission-mode --session-id <claude-id> --mode bypassPermissions --json
+triangle-bridge antigravity set-permission-mode --session-id <antigravity-id> --mode always-proceed --scope project
+```
+
+Approval changes use native app controls and verify readback. Ordinary message delivery does not change permissions. Claude can only switch to `bypassPermissions` when the Desktop child was launched with the corresponding allow/skip flag.
+
+## Native transports
+
+- **Codex:** the running app's named-pipe tool endpoint for session operations; its desktop owner protocol for settings.
+- **Claude Desktop Code:** existing renderer/raw session APIs, then verified app-owned live stdin with replayed visible user inputs. Explicit native `peer` transport is retained; its meta messages can be hidden in the UI.
+- **Antigravity:** its existing local desktop debugger endpoint, native product identity check, authenticated language-server client, and runtime protobuf descriptors. No browser instance is started.
+
+These adapters operate on user desktop sessions. A separate model CLI resume or web chat is not an automatic fallback. No app binaries are patched and apps are not restarted. Claude Cowork requires its existing renderer/raw API; the tested three-app flow uses Claude Desktop Code.
+
+Codex remote targets can use `--context-thread <local-id> --host-id <observed-host>` for native send/read. Approval settings in this release target the local desktop host. Use the adapter's `--help` for additional receipt and diagnostic commands.
+
+## Development and verification
 
 ```powershell
 npm run check
 npm test
-git diff --cached | Select-String -Pattern "password|secret|api[_-]?key|token|authorization|Bearer"
+npm pack --dry-run
 ```
 
-## Repository Layout
+The test suite covers exact session isolation, Unicode transport, unknown delivery, duplicate unconfirmed sends, visible Claude frames, native project discovery, protobuf model/settings serialization, and permission readback. Package contents exclude tests and local app state.
 
-```text
-scripts/
-  codex_bridge.mjs          Claude -> Codex CLI
-  codex_app_pipe.mjs        Standalone native app-tool pipe transport
-  codex_app_pipe.test.mjs   Framing, Unicode, routing and failure regressions
-  claude_code_bridge.mjs    Codex -> Claude Desktop Code/Cowork bridge
-  claude_live_stdin.ps1     Windows helper for app-owned Claude Code stdin pipes
-  claude_peer_transport.mjs Exact session routing, peer frames and transcript receipts
-  claude_peer_pipe.ps1      Windows pipe owner and process-start verification
-  claude_peer_transport.test.mjs Routing, permission envelope and receipt regressions
-skills/
-  claude-code-bridge/
-    SKILL.md                Codex skill instructions
-```
+The three apps were exercised in all six send/read directions on Windows, including new desktop sessions and approval readback. Tested versions: Codex 26.1007.2314.0, Claude Desktop 2.31226.1.0 (Code child 2.1.295), Antigravity 2.22.0. These native internal interfaces can change with app updates; errors are reported explicitly rather than switching to unrelated sessions.
+
+See [SECURITY.md](SECURITY.md) for local data handling. Licensed under MIT.

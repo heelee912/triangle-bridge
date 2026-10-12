@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildCreateCliArgs, createCodeSession, findImportedSession, resumeDeepLink } from "./claude_session_create.mjs";
-import { createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, peerReceipt, probePeer, sendPeer, waitForPeerReceipt } from "./claude_peer_transport.mjs";
+import { createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, peerReceipt, probePeer, reservePeerMessage, sendPeer, waitForPeerReceipt } from "./claude_peer_transport.mjs";
+import { buildVisibleUserFrame, chooseDesktopSendTransport } from './claude_visible_transport.mjs';
 
 const CODE_MODEL = "claude-opus-4-8";
 const CODE_EFFORT = "xhigh";
@@ -35,7 +36,8 @@ const packageClaudeDataDirs = (() => {
   }
 })();
 const claudeDataDirs = [...new Set([conventionalClaudeDataDir, ...packageClaudeDataDirs])];
-const claudeDataDir = claudeDataDirs.find((candidate) => fs.existsSync(candidate)) || conventionalClaudeDataDir;
+const claudeDataDir = claudeDataDirs.find((candidate) => fs.existsSync(path.join(candidate, 'Local State'))) ||
+  claudeDataDirs.find((candidate) => fs.existsSync(candidate)) || conventionalClaudeDataDir;
 const codeSessionRoots = claudeDataDirs.map((candidate) => path.join(candidate, "claude-code-sessions"));
 const coworkSessionRoots = claudeDataDirs.map((candidate) => path.join(candidate, "local-agent-mode-sessions"));
 const developerSettingsPath = path.join(claudeDataDir, "developer_settings.json");
@@ -738,17 +740,21 @@ function findClaudeCodeExecutable() {
     .find((exe) => exe && fs.existsSync(exe));
   if (running) return running;
 
-  const root = path.join(claudeDataDir, "claude-code");
   const candidates = [];
-  try {
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const exe = path.join(root, entry.name, "claude.exe");
-      const stat = safeStat(exe);
-      if (stat) candidates.push({ exe, version: entry.name, mtimeMs: stat.mtimeMs });
-    }
-  } catch {
-    return null;
+  for (const dataDir of claudeDataDirs) {
+    const root = path.join(dataDir, 'claude-code');
+    try {
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory()) continue;
+        const versionDir = path.join(root, entry.name);
+        const locations = [versionDir, ...fs.readdirSync(versionDir, { withFileTypes: true }).filter(e => e.isDirectory()).map(e => path.join(versionDir, e.name))];
+        for (const location of locations) {
+          const exe = path.join(location, 'claude.exe');
+          const stat = safeStat(exe);
+          if (stat) candidates.push({ exe, version: entry.name, mtimeMs: stat.mtimeMs });
+        }
+      }
+    } catch { /* A packaged app can virtualize the conventional profile path. */ }
   }
   candidates.sort((a, b) => compareVersionLike(b.version, a.version) || b.mtimeMs - a.mtimeMs);
   return candidates[0]?.exe || null;
@@ -897,7 +903,7 @@ async function enforceDesktopPermissionMode(cliSessionId, mode, timeoutMs) {
     const current = findImportedSession(listSessions("code"), cliSessionId);
     return current?.permissionMode === mode ? current : null;
   }, timeoutMs).catch(() => null);
-  return { applied: true, childPid: runtime.childPid, requestId: runtime.requestId, desktopRecordedMode: recorded?.permissionMode || findImportedSession(listSessions("code"), cliSessionId)?.permissionMode || null };
+  return { applied: !!recorded, childPid: runtime.childPid, requestId: runtime.requestId, desktopRecordedMode: recorded?.permissionMode || null };
 }
 
 async function cmdCreate(args, surface, rest) {
@@ -913,8 +919,8 @@ async function cmdCreate(args, surface, rest) {
       prompt,
       title: args.title,
       // A new session follows the model the user currently runs in Desktop, not a hard-coded default.
-      model: args.model || recentDesktop?.model || CODE_MODEL,
-      effort: args.effort || recentDesktop?.effort || CODE_EFFORT,
+      model: args.model || recentDesktop?.model,
+      effort: args.effort || recentDesktop?.effort,
       permissionMode: args["permission-mode"] || "bypassPermissions",
       timeoutMs: toInt(args["timeout-ms"], DEFAULT_CLI_TIMEOUT_MS),
       importTimeoutMs: toInt(args["import-timeout-ms"], 30000),
@@ -2202,6 +2208,11 @@ async function chooseSendTransport(args, surface, session = null) {
   const raw = await createMainInspectorClient(probeArgs, surface);
   if (raw.available) return "raw";
 
+  // Peer inputs are meta messages and can be hidden by Desktop. Ordinary sends
+  // use the app-owned stream-json input and its replayed visible user row.
+  const visible = chooseDesktopSendTransport(surface);
+  if (visible) return visible;
+
   if (surface === "code" && session) {
     try { findPeerRuntime(session, listClaudeCodeCliProcesses()); return "peer"; } catch { /* Continue only to ID-bound transports. */ }
   }
@@ -2514,7 +2525,14 @@ async function cmdSetPermissionMode(args, surface) {
   buildPermissionModeControlFrame(mode);
   const session = resolveSession(surface, args);
   const dryRun = toBool(args["dry-run"]);
+  if (!dryRun) await wakeCodeSession(session, toInt(args['wake-timeout-ms'], 30000));
   const { requestId, parentPid, childPid, helper } = applyRuntimePermissionMode(session, mode, { dryRun });
+  const recorded = dryRun ? null : await waitForCondition(() => {
+    const current = findImportedSession(listSessions('code'), session.cliSessionId);
+    return current?.permissionMode === mode ? current : null;
+  }, toInt(args['timeout-ms'], 30000)).catch(() => null);
+  if (!dryRun && !recorded) throw new CliError('Permission request was written but Desktop mode readback did not match', 2,
+    { sessionId: session.sessionId, requestId, mode, delivery: 'written-unconfirmed' });
   printJson({
     ok: true,
     dryRun,
@@ -2525,12 +2543,12 @@ async function cmdSetPermissionMode(args, surface) {
     parentPid,
     childPid,
     helper,
-    // The control_response goes to Claude Desktop on the child's stdout, so the bridge cannot read it.
-    note: "Written to the running Claude Code process. Claude Desktop relaunches a session with its own stored mode, so a restarted process returns to that mode.",
+    desktopRecordedMode: recorded?.permissionMode || null,
+    delivery: dryRun ? 'dry-run' : 'desktop-confirmed',
   });
 }
 
-async function codeLiveStdinAction(_args, surface, session, prompt) {
+async function codeLiveStdinAction(args, surface, session, prompt) {
   if (surface !== "code") {
     throw new CliError("live-stdin transport only supports Code sessions");
   }
@@ -2538,11 +2556,36 @@ async function codeLiveStdinAction(_args, surface, session, prompt) {
     throw new CliError(`Code session has no cliSessionId: ${session.sessionId}`);
   }
 
+  await wakeCodeSession(session, toInt(args['wake-timeout-ms'], 30000));
   const { liveProcess, childPid, parentPid } = resolveLiveCodeProcess(session);
-  const frame = claudeCodeStreamJsonUserFrame(prompt);
-  const helper = runLiveStdinHelper(parentPid, childPid, frame);
+  if (!/(?:^|\s)--replay-user-messages(?:\s|$)/.test(liveProcess.CommandLine || liveProcess.commandLine || ''))
+    throw new CliError('The app-owned child does not replay visible user messages; no prompt was sent', 2, { delivery: 'not-sent', sessionId: session.sessionId });
+  const runtime = { sessionId: session.cliSessionId };
+  const reservation = await reservePeerMessage(runtime, prompt);
+  const transcriptPath = codeTranscriptPath(session);
+  const offset = fs.existsSync(transcriptPath) ? fs.statSync(transcriptPath).size : 0;
+  const frame = buildVisibleUserFrame(session.cliSessionId, prompt, reservation.messageId);
+  let helper;
+  try { helper = runLiveStdinHelper(parentPid, childPid, frame); }
+  catch (error) {
+    await markPeerMessage(reservation.recordPath, reservation.messageId, 'unknown');
+    throw new CliError('Visible input acknowledgement lost; read the exact session before retrying', 2,
+      { delivery: 'unknown', messageId: reservation.messageId, sessionId: session.cliSessionId, error: error.message });
+  }
   if (!helper.ok) {
-    throw new CliError("live-stdin helper failed to write to Claude Code stdin", 2, helper);
+    await markPeerMessage(reservation.recordPath, reservation.messageId, 'unknown');
+    throw new CliError("live-stdin helper failed to write to Claude Code stdin", 2, { ...helper, delivery: 'unknown', messageId: reservation.messageId });
+  }
+  await markPeerMessage(reservation.recordPath, reservation.messageId, 'written-unconfirmed');
+  let receipt;
+  if (toBool(args.wait)) {
+    try {
+      receipt = await waitForPeerReceipt(transcriptPath, runtime, reservation.messageId, toInt(args['timeout-ms'], DEFAULT_WAIT_TIMEOUT_MS), offset);
+      await markPeerMessage(reservation.recordPath, reservation.messageId, 'confirmed');
+    } catch (error) {
+      await markPeerMessage(reservation.recordPath, reservation.messageId, error.details?.delivery || 'unknown');
+      throw error;
+    }
   }
 
   return {
@@ -2560,7 +2603,11 @@ async function codeLiveStdinAction(_args, surface, session, prompt) {
       sessionId: session.sessionId,
       cliSessionId: session.cliSessionId,
       helper,
-      process: liveProcess,
+      messageId: reservation.messageId,
+      outboxPath: reservation.recordPath,
+      visibility: 'ordinary-user-message',
+      delivery: receipt ? 'transcript-confirmed' : 'written-unconfirmed',
+      ...(receipt || {}),
     },
   };
 }
@@ -2981,7 +3028,7 @@ async function cmdSend(args, surface, rest) {
         ? { ...args, "no-bootstrap": true }
         : args;
 
-  const forceOps = buildForceOperations(surface, session.sessionId);
+  const forceOps = []; // Sending preserves the recipient's selected model and permissions.
   const sendArgs = buildSendArgs(surface, session.sessionId, prompt);
   const { bridge, result } =
     chosenTransport === "cli"
@@ -3004,12 +3051,12 @@ async function cmdSend(args, surface, rest) {
     surface,
     sessionId: session.sessionId,
     transport: chosenTransport,
-    defaults: chosenTransport === "peer" ? null : defaultsForSurface(surface),
+    defaults: ['peer', 'live-stdin', 'renderer', 'raw'].includes(chosenTransport) ? null : defaultsForSurface(surface),
     bridge: bridge.transport,
     result,
   };
 
-  if (toBool(args.wait) && chosenTransport !== "peer") {
+  if (toBool(args.wait) && !['peer', 'live-stdin'].includes(chosenTransport)) {
     output.transcript = await waitForAssistantReply(surface, args, before);
   }
 

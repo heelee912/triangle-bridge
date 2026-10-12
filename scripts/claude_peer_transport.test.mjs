@@ -10,7 +10,7 @@ import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { buildPeerFrame, createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, parsePeerHelperReply, peerReceipt, reservePeerMessage, validatePeerKey, waitForPeerReceipt, withPeerOutboxLock } from "./claude_peer_transport.mjs";
 
-const session = { cliSessionId: "target", cwd: "C:\\Projects\\YomiLayer" };
+const session = { cliSessionId: "target", cwd: "C:\\Projects\\Example" };
 const runtime = { pid: 42, sessionId: "target", cwd: session.cwd, procStart: "123456789", entrypoint: "claude-desktop", peerProtocol: 1, messagingSocketPath: "\\\\.\\pipe\\LOCAL\\cc-msg-" + "a".repeat(32) };
 const child = { ProcessId: 42, CommandLine: "claude.exe --input-format stream-json" };
 const sender = { senderMode: "bypass", senderSessionId: "codex-session" };

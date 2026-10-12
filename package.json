@@ -1,15 +1,21 @@
 {
-  "name": "claude-codex-bridge",
-  "version": "0.2.0",
-  "private": true,
+  "name": "triangle-bridge",
+  "version": "0.3.0",
   "type": "module",
-  "description": "Bidirectional local bridge experiments between Claude Desktop Code sessions and Codex desktop threads.",
+  "engines": { "node": ">=22" },
+  "os": ["win32"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/heelee912/triangle-bridge.git" },
+  "files": ["scripts/*.mjs", "scripts/*.ps1", "!scripts/*.test.mjs", "skills/triangle-bridge", "README.md", "SECURITY.md", "LICENSE"],
+  "description": "Exact desktop session bridge for Codex, Claude Desktop Code and Antigravity.",
   "bin": {
+    "triangle-bridge": "./scripts/triangle_bridge.mjs",
     "codex-bridge": "./scripts/codex_bridge.mjs",
-    "claude-code-bridge": "./scripts/claude_code_bridge.mjs"
+    "claude-code-bridge": "./scripts/claude_code_bridge.mjs",
+    "antigravity-bridge": "./scripts/antigravity_bridge.mjs"
   },
   "scripts": {
-    "check": "node --check scripts/codex_bridge.mjs && node --check scripts/codex_app_pipe.mjs && node --check scripts/codex_app_pipe.test.mjs && node --check scripts/claude_code_bridge.mjs && node --check scripts/claude_session_create.mjs && node --check scripts/claude_session_create.test.mjs && node --check scripts/claude_peer_transport.mjs && node --check scripts/claude_peer_transport.test.mjs",
-    "test": "node --test scripts/codex_app_pipe.test.mjs scripts/claude_peer_transport.test.mjs scripts/claude_session_create.test.mjs"
+    "check": "node --check scripts/codex_bridge.mjs && node --check scripts/codex_app_pipe.mjs && node --check scripts/claude_code_bridge.mjs && node --check scripts/claude_session_create.mjs && node --check scripts/claude_peer_transport.mjs && node --check scripts/claude_visible_transport.mjs && node --check scripts/antigravity_bridge.mjs && node --check scripts/desktop_rpc.mjs && node --check scripts/codex_desktop_settings.mjs && node --check scripts/triangle_bridge.mjs && node --check scripts/install_skills.mjs && node --check scripts/desktop_adapters.test.mjs",
+    "test": "node --test scripts/codex_app_pipe.test.mjs scripts/claude_peer_transport.test.mjs scripts/claude_session_create.test.mjs scripts/desktop_adapters.test.mjs"
   }
 }

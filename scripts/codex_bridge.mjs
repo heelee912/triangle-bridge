@@ -30,6 +30,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { openAppTools, toolParams, decodeToolResult, loadPrompt } from './codex_app_pipe.mjs';
+import { setDesktopPermissions, readDesktopSettings, permissionSettings } from './codex_desktop_settings.mjs';
 
 const PIPE = process.platform === "win32"
   ? "\\\\.\\pipe\\codex-ipc"
@@ -48,7 +49,8 @@ const VERSION = {
   "thread-follower-compact-thread": 1,
   "thread-follower-steer-turn": 1,
   "thread-follower-interrupt-turn": 2,
-  "thread-follower-update-thread-settings": 1,
+  "thread-follower-update-thread-settings": 2,
+  "thread-follower-read-model-settings": 1,
   "thread-follower-edit-last-user-turn": 1,
   "thread-follower-command-approval-decision": 1,
   "thread-follower-file-approval-decision": 1,
@@ -188,6 +190,8 @@ class CodexBus {
   // Public RPC: routed by capability (owner of params.conversationId).
   request(method, params, opts) { return this._send(method, params, opts); }
 
+  broadcast(method, params) { this._write({ type: 'broadcast', sourceClientId: this.clientId, version: ver(method), method, params }); }
+
   close() { try { this.socket?.end(); } catch {} }
 }
 
@@ -286,8 +290,72 @@ async function main() {
       'reply --thread <exact ID> --host-id <host> --reply-tag <published first line> [--after-cursor <cursor>] [--message-id <ID>] [--turn-id <ID>]',
       'Cloud targets: --context-thread <local caller thread ID> --host-id <observed target host>',
       'list',
+      'create --context-thread <caller ID> --cwd <registered project path> --prompt-file <UTF-8 file> [--title TEXT] [--mode always-proceed]',
+      'set-permission-mode --thread <exact ID> --mode always-proceed|request-review',
+      'settings --thread <exact ID>',
     ], transport: 'Standalone local Codex app tool pipe; no OmniCodex dependency',
       delivery: 'Send returns the native acknowledgement; read distinguishes queued input from a completed reply. Unknown delivery is not automatically retried.' });
+    return;
+  }
+
+  if (['create', 'set-permission-mode', 'settings', 'list'].includes(cmd) && args.transport !== 'ipc') {
+    let pipe;
+    try {
+      // Discovery may use a Desktop-known thread as a read-only caller context.
+      // This never chooses a message recipient or starts a model turn.
+      const knownDesktop = readGlobalState();
+      const context = args['context-thread'] || args.thread || process.env.CODEX_THREAD_ID ||
+        (['list', 'create'].includes(cmd) ? knownDesktop.openThreadIds[0] || Object.keys(knownDesktop.threadRootHints)[0] : undefined);
+      if (!context) throw new Error('Pass --context-thread <known Codex desktop ID> for discovery or creation');
+      const ready = await openAppTools(['settings', 'set-permission-mode'].includes(cmd) ? args.thread : context,
+        { callerThreadId: context, hostId: args['host-id'] });
+      pipe = ready.pipe;
+      const call = async (name, payload, mutation = false) => decodeToolResult(await pipe.request('tools/call', toolParams(context, name, payload), { mutation, timeoutMs: 60000 }));
+      if (cmd === 'list') {
+        const response = await call('list_threads', { limit: Number(args.limit || 50) });
+        if (args.cwd) for (const key of ['threads', 'pinnedThreads']) response[key] = (response[key] || []).filter(t => t.cwd && path.resolve(t.cwd).toLowerCase() === path.resolve(args.cwd).toLowerCase());
+        out({ ok: true, source: 'desktop-app', response }); return;
+      }
+      if (cmd === 'create') {
+        if (!args.cwd) throw new Error('Desktop creation requires --cwd matching a registered project');
+        if (args.mode) permissionSettings(args.mode);
+        const projectResponse = await call('list_projects', {});
+        const projects = projectResponse.projects || [...(projectResponse.localProjects || []), ...(projectResponse.remoteProjects || [])];
+        const targetPath = path.resolve(args.cwd).toLowerCase();
+        const matches = projects.filter(p => [p.path, p.cwd, p.rootPath, p.workspacePath].some(v => v && path.resolve(v).toLowerCase() === targetPath));
+        if (matches.length !== 1) throw new Error('Expected one registered Codex desktop project for --cwd');
+        const prompt = loadPrompt(args);
+        const created = await call('create_thread', { prompt: args.mode ? 'Desktop bridge initialization. Do not run tools. Reply BRIDGE-READY.' : prompt,
+          ...(args.title ? { title: args.title } : {}), target: { type: 'project', projectId: matches[0].projectId || matches[0].id, environment: { type: 'local' } },
+          ...(args.model ? { model: args.model } : {}) }, true);
+        if (!created.threadId) { out({ ok: true, delivery: 'creation-pending', response: created }); return; }
+        out({ ok: true, delivery: 'desktop-session-created', ...created });
+        // Print the ID before further operations so a partial failure cannot lose it.
+        if (args.mode) {
+          const deadline = Date.now() + 20000;
+          let destination, lastError;
+          do {
+            try { destination = await call('read_thread', { threadId: created.threadId, hostId: created.hostId || 'local', turnLimit: 1, includeOutputs: false, maxOutputCharsPerItem: 0 }); }
+            catch (error) { lastError = error; }
+            if (destination?.thread?.id === created.threadId) break;
+            await new Promise(resolve => setTimeout(resolve, 250));
+          } while (Date.now() < deadline);
+          if (destination?.thread?.id !== created.threadId) throw new Error(`Created ${created.threadId}, but desktop readiness was not confirmed: ${lastError?.message || 'no exact readback'}`);
+          await bus.connect();
+          out(await setDesktopPermissions(bus, created.threadId, args.mode, created.hostId || 'local'));
+          const sent = await call('send_message_to_thread', { threadId: created.threadId, prompt }, true);
+          out({ ok: true, conversationId: created.threadId, delivery: 'app-acknowledged', response: sent });
+        }
+        return;
+      }
+      if (!args.thread) throw new Error('Permission operations require --thread <exact ID>');
+      await bus.connect();
+      if (cmd === 'settings') {
+        const { settings } = await readDesktopSettings(bus, args.thread, ready.state.thread.hostId || 'local');
+        out({ ok: true, conversationId: args.thread, approvalPolicy: settings.approvalPolicy, sandboxPolicy: settings.sandboxPolicy, model: settings.model, effort: settings.effort });
+      } else out(await setDesktopPermissions(bus, args.thread, args.mode, ready.state.thread.hostId || 'local'));
+    } catch (error) { out({ ok: false, error: error.message, ...(error.delivery ? { delivery: error.delivery } : {}) }); process.exitCode = 1; }
+    finally { pipe?.close(); bus.close(); }
     return;
   }
 
