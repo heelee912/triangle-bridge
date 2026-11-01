@@ -82,6 +82,8 @@ triangle-bridge antigravity read --session-id <antigravity-id>
 
 Claude accepts its exact Desktop `local_…` ID or the corresponding internal session ID. Normal sends use visible ordinary user inputs, including the app-owned stream-json path when the renderer API is unavailable. The target model and approval mode are preserved.
 
+For the live input path, the bridge checks the registered session, child process and process start time, then verifies which single-instance pipes Windows reports as used by that process. It excludes the child's stdout and stderr and sends only when one input candidate remains. If those checks fail, it refuses the send rather than guessing from pipe-number order.
+
 Antigravity attaches a request UUID to each input and selects its matching response. `--model <native-model-id-or-label>` is optional; the existing selected model is used otherwise.
 
 `app-acknowledged` and `written-unconfirmed` mean acceptance or a pipe write. Read the response before claiming completed work. Claude `--wait` confirms a matching assistant text entry, which may precede completion of tools. Antigravity `reply-complete` confirms the tagged input's response after the session becomes idle.

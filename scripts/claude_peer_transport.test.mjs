@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import net from "node:net";
 import { randomUUID } from "node:crypto";
+import { runHiddenPowerShell } from './hidden_powershell.mjs';
 import { buildPeerFrame, createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, parsePeerHelperReply, peerReceipt, reservePeerMessage, validatePeerKey, waitForPeerReceipt, withPeerOutboxLock } from "./claude_peer_transport.mjs";
 
 const session = { cliSessionId: "target", cwd: "C:\\Projects\\Example" };
@@ -34,15 +35,16 @@ test("Windows peer helper preserves UTF-8 checkout identity and still rejects a 
     server.close();
     fs.rmSync(home, { recursive: true, force: true });
   });
-  const start = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+  const start = runHiddenPowerShell(["-NoProfile", "-NonInteractive", "-Command",
     `([Diagnostics.Process]::GetProcessById(${process.pid})).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()`],
   { encoding: "utf8", windowsHide: true, timeout: 10000 });
-  assert.equal(start.status, 0, start.stderr);
-  const target = { pid: process.pid, sessionId: randomUUID(), cwd: "C:\\Projects\\주식_日本語", procStart: start.stdout.trim(), socketPath };
+  const target = { pid: process.pid, sessionId: randomUUID(), cwd: "C:\\Projects\\주식_日本語", procStart: start.trim(), socketPath };
   fs.writeFileSync(path.join(records, `${process.pid}.json`), JSON.stringify({ ...target, messagingSocketPath: socketPath }), "utf8");
   async function probe(destination) {
     const helper = fileURLToPath(new URL("./claude_peer_pipe.ps1", import.meta.url));
-    const child = spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helper],
+    const wrapper = new URL('./hidden_powershell.mjs', import.meta.url).href;
+    const runner = `import {runHiddenPowerShell} from ${JSON.stringify(wrapper)};import fs from 'node:fs';process.stdout.write(runHiddenPowerShell(['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',process.argv[1]],{input:fs.readFileSync(0,'utf8'),encoding:'utf8',timeout:15000}));`;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', runner, helper],
       { env: { ...process.env, USERPROFILE: home }, windowsHide: true, timeout: 15000 });
     let stdout = "", stderr = "";
     child.stdout.setEncoding("utf8").on("data", (chunk) => { stdout += chunk; });
@@ -251,6 +253,14 @@ test("receipt distinguishes received message from subsequent reply", () => {
   assert.equal(peerReceipt(entries, "target", "request-1").assistantReplyObserved, false);
   entries.push({ type: "assistant", sessionId: "target", parentUuid: "request-1", message: { content: [{ type: "text", text: "received" }] } });
   assert.equal(peerReceipt(entries, "target", "request-1").assistantText, "received");
+});
+
+test('a live desktop send waits for a completed assistant turn', () => {
+  const request = { type: 'user', sessionId: 'target', uuid: 'request-1' };
+  const progress = { type: 'assistant', sessionId: 'target', uuid: 'progress', parentUuid: 'request-1', message: { stop_reason: 'tool_use', content: [{ type: 'text', text: 'working' }] } };
+  const final = { type: 'assistant', sessionId: 'target', uuid: 'final', parentUuid: 'progress', message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'done' }] } };
+  assert.equal(peerReceipt([request, progress], 'target', 'request-1', { requireFinal: true }).assistantReplyObserved, false);
+  assert.equal(peerReceipt([request, progress, final], 'target', 'request-1', { requireFinal: true }).assistantText, 'done');
 });
 
 // Anonymized shape of a peer prompt received while Claude was already working.

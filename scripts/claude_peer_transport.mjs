@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { runHiddenPowerShell } from './hidden_powershell.mjs';
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -88,7 +88,7 @@ export function parsePeerHelperReply(output, envelope) {
 function runHelper(envelope) {
   let output;
   try {
-    output = execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helperPath], {
+    output = runHiddenPowerShell(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", helperPath], {
       input: Buffer.from(JSON.stringify(envelope), "utf8").toString("base64"),
       encoding: "utf8",
       timeout: 15000,
@@ -208,7 +208,7 @@ function isQueuedPrompt(entry) {
   return entry.type === "attachment" && entry.attachment?.type === "queued_command" && entry.attachment.commandMode === "prompt";
 }
 
-export function peerReceipt(entries, sessionId, messageId) {
+export function peerReceipt(entries, sessionId, messageId, { requireFinal = false } = {}) {
   const index = entries.findIndex((entry) => {
     if (entry.sessionId !== sessionId || typeof entry.uuid !== "string" || !entry.uuid) return false;
     if (entry.type === "user") return entry.uuid === messageId;
@@ -227,7 +227,8 @@ export function peerReceipt(entries, sessionId, messageId) {
     if (entry.uuid) descendants.add(entry.uuid);
     if (entry.type === "assistant") replies.push(entry);
   }
-  const text = replies.flatMap((entry) => Array.isArray(entry.message?.content) ? entry.message.content.filter((block) => block.type === "text").map((block) => block.text) : []).join("\n");
+  const selected = requireFinal ? replies.filter(entry => entry.message?.stop_reason === 'end_turn') : replies;
+  const text = selected.flatMap((entry) => Array.isArray(entry.message?.content) ? entry.message.content.filter((block) => block.type === "text").map((block) => block.text) : []).join("\n");
   return { messageId, sessionId, userMessageObserved: true, assistantReplyObserved: Boolean(text), assistantText: text };
 }
 
@@ -263,12 +264,12 @@ export function createTranscriptTail(transcriptPath, initialOffset = 0) {
   };
 }
 
-export async function waitForPeerReceipt(transcriptPath, runtime, messageId, timeoutMs = 120000, initialOffset = 0) {
+export async function waitForPeerReceipt(transcriptPath, runtime, messageId, timeoutMs = 120000, initialOffset = 0, options = {}) {
   const deadline = Date.now() + timeoutMs;
   const readTail = createTranscriptTail(transcriptPath, initialOffset);
   let receipt = null;
   while (Date.now() < deadline) {
-    receipt = peerReceipt(readTail(), runtime.sessionId, messageId);
+    receipt = peerReceipt(readTail(), runtime.sessionId, messageId, options);
     if (receipt?.assistantReplyObserved) return { ...receipt, delivery: "transcript-confirmed", transcriptPath };
     await new Promise((resolve) => setTimeout(resolve, 500));
   }

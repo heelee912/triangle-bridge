@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { runHiddenPowerShell } from './hidden_powershell.mjs';
 import { buildCreateCliArgs, createCodeSession, findImportedSession, resumeDeepLink } from "./claude_session_create.mjs";
 import { createTranscriptTail, findPeerMessageRecord, findPeerRuntime, findSessionById, markPeerMessage, peerReceipt, probePeer, reservePeerMessage, sendPeer, waitForPeerReceipt } from "./claude_peer_transport.mjs";
 import { buildVisibleUserFrame, chooseDesktopSendTransport } from './claude_visible_transport.mjs';
@@ -36,7 +37,15 @@ const packageClaudeDataDirs = (() => {
     return [];
   }
 })();
-const claudeDataDirs = [...new Set([conventionalClaudeDataDir, ...packageClaudeDataDirs])];
+const desktopDataRoot = path.join(localAppData, "Claude-Data");
+const desktopClaudeDataDirs = (() => {
+  try {
+    return fs.readdirSync(desktopDataRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && entry.name.toLowerCase().startsWith("claude_"))
+      .map((entry) => path.join(desktopDataRoot, entry.name));
+  } catch { return []; }
+})();
+const claudeDataDirs = [...new Set([conventionalClaudeDataDir, ...packageClaudeDataDirs, ...desktopClaudeDataDirs])];
 const claudeDataDir = claudeDataDirs.find((candidate) => fs.existsSync(path.join(candidate, 'Local State'))) ||
   claudeDataDirs.find((candidate) => fs.existsSync(candidate)) || conventionalClaudeDataDir;
 const codeSessionRoots = claudeDataDirs.map((candidate) => path.join(candidate, "claude-code-sessions"));
@@ -258,6 +267,8 @@ function summarizeCodeSession(filePath) {
     surface: "code",
     sessionId,
     cliSessionId: raw.cliSessionId || raw.claudeSessionId || raw.sessionUuid || null,
+    priorCliSessionIds: Array.isArray(raw.priorCliSessionIds) ? raw.priorCliSessionIds : [],
+    rewindEdges: Array.isArray(raw.rewindEdges) ? raw.rewindEdges.map(({ parent, child }) => ({ parent, child })) : [],
     cwd: raw.cwd || raw.workingDirectory || raw.projectPath || null,
     title: raw.title || raw.name || null,
     model: raw.model || raw.sessionSettings?.model || null,
@@ -300,7 +311,8 @@ function listCodeSessions({ cwd } = {}) {
   const normalizedCwd = cwd ? normalizeFilePath(cwd) : "";
   const files = walkFilesFromRoots(
     codeSessionRoots,
-    (filePath) => path.basename(filePath).startsWith("local_") && filePath.endsWith(".json"),
+    (filePath) => path.basename(filePath).startsWith("local_") && filePath.endsWith(".json") &&
+      !filePath.split(/[\\/]/).some(part => part.toLowerCase() === 'waiting-input'),
   );
   return files
     .map((filePath) => {
@@ -370,6 +382,14 @@ function codeTranscriptPath(session) {
     10000,
   ).sort((a, b) => mtimeMs(b) - mtimeMs(a));
   return matches[0] || expected;
+}
+
+function createdTranscriptPath(cwd, sessionId, root = transcriptRoot) {
+  const matches = walkFiles(root, filePath => path.basename(filePath) === `${sessionId}.jsonl`, 10000)
+    .filter(filePath => readJsonl(filePath).some(entry => entry.sessionId === sessionId &&
+      typeof entry.cwd === 'string' && path.win32.resolve(entry.cwd).toLowerCase() === path.win32.resolve(cwd).toLowerCase()));
+  if (matches.length > 1) throw new CliError('Multiple transcripts match the created session and folder; refusing to import', 2, { sessionId });
+  return matches[0] || path.join(root, encodeProjectPath(cwd), `${sessionId}.jsonl`);
 }
 
 function readJsonl(filePath) {
@@ -603,7 +623,7 @@ Get-CimInstance Win32_Process |
   ConvertTo-Json -Compress -Depth 4
 `;
   try {
-    const output = execFileSync("powershell.exe", ["-NoProfile", "-Command", command], {
+    const output = runHiddenPowerShell(["-NoProfile", "-Command", command], {
       encoding: "utf8",
       timeout: 5000,
       windowsHide: true,
@@ -699,7 +719,8 @@ function isClaudeCodeCliProcess(proc) {
   return (
     exe.endsWith("\\claude.exe") &&
     (exe.includes("\\appdata\\roaming\\claude\\claude-code\\") ||
-      exe.includes("\\localcache\\roaming\\claude\\claude-code\\"))
+      exe.includes("\\localcache\\roaming\\claude\\claude-code\\") ||
+      claudeDataDirs.some((dir) => exe.startsWith(lower(path.join(dir, "claude-code")) + "\\")))
   );
 }
 
@@ -775,7 +796,7 @@ if ([System.Text.Encoding]::ASCII.GetString($bytes[0..4]) -eq 'DPAPI') {
 $plain = [System.Security.Cryptography.ProtectedData]::Unprotect($bytes, $null, [System.Security.Cryptography.DataProtectionScope]::CurrentUser)
 [Console]::Write([Convert]::ToBase64String($plain))
 `;
-  return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+  return runHiddenPowerShell(["-NoProfile", "-NonInteractive", "-Command", command], {
     encoding: "utf8",
     timeout: 10000,
     windowsHide: true,
@@ -885,10 +906,10 @@ function openClaudeDeepLink(url) {
 function applyRuntimePermissionMode(session, mode, { dryRun = false } = {}) {
   const requestId = crypto.randomUUID();
   const frame = buildPermissionModeControlFrame(mode, requestId);
-  const { liveProcess, childPid, parentPid } = resolveLiveCodeProcess(session);
+  const { liveProcess, childPid, parentPid, runtime } = resolveLiveCodeProcess(session);
   const blocker = permissionModeLaunchBlocker(liveProcess.CommandLine || liveProcess.commandLine, mode);
   if (blocker) throw new CliError(blocker, 2, { childPid });
-  const helper = runLiveStdinHelper(parentPid, childPid, frame, { dryRun });
+  const helper = runLiveStdinHelper(parentPid, childPid, frame, { dryRun, runtime });
   if (!helper.ok) throw new CliError("live-stdin helper failed to write the permission mode request", 2, helper);
   return { requestId, parentPid, childPid, helper };
 }
@@ -934,7 +955,7 @@ async function cmdCreate(args, surface, rest) {
       executablePath,
       inferenceToken: () => selectDesktopInferenceToken(readDesktopOauthTokenCache()),
       runCli: runCliWithStdin,
-      transcriptPath: (cwd, sessionId) => path.join(transcriptRoot, encodeProjectPath(cwd), `${sessionId}.jsonl`),
+      transcriptPath: createdTranscriptPath,
       openUrl: openClaudeDeepLink,
       listCodeSessions: () => listSessions("code"),
     },
@@ -1034,7 +1055,7 @@ foreach ($id in $ids) {
   Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
 }
 `;
-  execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], {
+  runHiddenPowerShell(["-NoProfile", "-NonInteractive", "-Command", command], {
     encoding: "utf8",
     timeout: 10000,
     windowsHide: true,
@@ -1076,7 +1097,7 @@ Get-NetTCPConnection -State Listen |
   ConvertTo-Json -Compress -Depth 4
 `;
   try {
-    const output = execFileSync("powershell.exe", ["-NoProfile", "-Command", command], {
+    const output = runHiddenPowerShell(["-NoProfile", "-Command", command], {
       encoding: "utf8",
       timeout: 5000,
       windowsHide: true,
@@ -2425,7 +2446,7 @@ function claudeCodeStreamJsonUserFrame(prompt) {
   });
 }
 
-function runLiveStdinHelper(parentPid, childPid, jsonLine, { dryRun = false } = {}) {
+function runLiveStdinHelper(parentPid, childPid, jsonLine, { dryRun = false, runtime } = {}) {
   if (process.platform !== "win32") {
     throw new CliError("live-stdin transport is only supported on Windows");
   }
@@ -2433,8 +2454,7 @@ function runLiveStdinHelper(parentPid, childPid, jsonLine, { dryRun = false } = 
     throw new CliError(`live-stdin helper not found: ${liveStdinHelperPath}`);
   }
 
-  const output = execFileSync(
-    "powershell.exe",
+  const output = runHiddenPowerShell(
     [
       "-NoProfile",
       "-NonInteractive",
@@ -2446,6 +2466,10 @@ function runLiveStdinHelper(parentPid, childPid, jsonLine, { dryRun = false } = 
       String(parentPid),
       "-ChildPid",
       String(childPid),
+      "-ExpectedStart",
+      runtime.procStart,
+      "-ExpectedSessionId",
+      runtime.sessionId,
       ...(dryRun ? ["-DryRun"] : ["-StdinBase64"]),
     ],
     {
@@ -2486,7 +2510,12 @@ function resolveLiveCodeProcess(session) {
   if (!childPid || !parentPid) {
     throw new CliError("Could not resolve live Claude Desktop parent/child PIDs", 2, { liveProcess });
   }
-  return { liveProcess, childPid, parentPid };
+  const runtime = findPeerRuntime(session, processes);
+  const proof = probePeer(runtime);
+  if (runtime.pid !== childPid || proof.ok !== true || proof.probe !== true || proof.serverPid !== childPid ||
+      proof.procStart !== runtime.procStart || proof.sessionId !== session.cliSessionId)
+    throw new CliError('The live Claude process could not be bound to the selected session', 2, { delivery: 'not-sent' });
+  return { liveProcess, childPid, parentPid, runtime };
 }
 
 function runtimeVerifiedStdinProcess(session, processes, runtime, probe) {
@@ -2498,10 +2527,29 @@ function runtimeVerifiedStdinProcess(session, processes, runtime, probe) {
   const matches = processes.filter((proc) => Number(proc.ProcessId || proc.processId) === runtime.pid);
   if (matches.length !== 1) return null;
   const commandLine = lower(matches[0].CommandLine || matches[0].commandLine);
-  if (/(?:^|\s)--(?:resume|session-id)(?:=|\s+)/.test(commandLine) ||
+  const identifiers = [...commandLine.matchAll(/(?:^|\s)--(?:resume|session-id)(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s]+))/g)]
+    .map(match => match[1] ?? match[2] ?? match[3]);
+  if (identifiers.some(id => !isSessionAncestor(session, id)) ||
       !/(?:^|\s)--input-format(?:=|\s+)stream-json(?:\s|$)/.test(commandLine) ||
       !/(?:^|\s)--output-format(?:=|\s+)stream-json(?:\s|$)/.test(commandLine)) return null;
   return matches[0];
+}
+
+function isSessionAncestor(session, identifier) {
+  if (identifier === lower(session.cliSessionId)) return false;
+  const previous = new Set((session.priorCliSessionIds || []).map(lower));
+  if (!previous.has(identifier)) return false;
+  const edges = session.rewindEdges || [];
+  let current = lower(session.cliSessionId);
+  const visited = new Set();
+  while (!visited.has(current)) {
+    visited.add(current);
+    const parents = edges.filter(edge => lower(edge.child) === current).map(edge => lower(edge.parent));
+    if (parents.length !== 1 || !previous.has(parents[0])) return false;
+    current = parents[0];
+    if (current === identifier) return true;
+  }
+  return false;
 }
 
 const CLAUDE_PERMISSION_MODES = ["default", "acceptEdits", "plan", "auto", "bypassPermissions"];
@@ -2561,30 +2609,30 @@ async function codeLiveStdinAction(args, surface, session, prompt) {
   }
 
   await wakeCodeSession(session, toInt(args['wake-timeout-ms'], 30000));
-  const { liveProcess, childPid, parentPid } = resolveLiveCodeProcess(session);
+  const { liveProcess, childPid, parentPid, runtime } = resolveLiveCodeProcess(session);
   if (!/(?:^|\s)--replay-user-messages(?:\s|$)/.test(liveProcess.CommandLine || liveProcess.commandLine || ''))
     throw new CliError('The app-owned child does not replay visible user messages; no prompt was sent', 2, { delivery: 'not-sent', sessionId: session.sessionId });
-  const runtime = { sessionId: session.cliSessionId };
   const reservation = await reservePeerMessage(runtime, prompt);
   const transcriptPath = codeTranscriptPath(session);
   const offset = fs.existsSync(transcriptPath) ? fs.statSync(transcriptPath).size : 0;
   const frame = buildVisibleUserFrame(session.cliSessionId, prompt, reservation.messageId);
   let helper;
-  try { helper = runLiveStdinHelper(parentPid, childPid, frame); }
+  try { helper = runLiveStdinHelper(parentPid, childPid, frame, { runtime }); }
   catch (error) {
     await markPeerMessage(reservation.recordPath, reservation.messageId, 'unknown');
     throw new CliError('Visible input acknowledgement lost; read the exact session before retrying', 2,
       { delivery: 'unknown', messageId: reservation.messageId, sessionId: session.cliSessionId, error: error.message });
   }
   if (!helper.ok) {
-    await markPeerMessage(reservation.recordPath, reservation.messageId, 'unknown');
-    throw new CliError("live-stdin helper failed to write to Claude Code stdin", 2, { ...helper, delivery: 'unknown', messageId: reservation.messageId });
+    const delivery = helper.delivery === 'not-sent' ? 'not-sent' : 'unknown';
+    await markPeerMessage(reservation.recordPath, reservation.messageId, delivery);
+    throw new CliError("live-stdin helper failed to write to Claude Code stdin", 2, { ...helper, delivery, messageId: reservation.messageId });
   }
   await markPeerMessage(reservation.recordPath, reservation.messageId, 'written-unconfirmed');
   let receipt;
   if (toBool(args.wait)) {
     try {
-      receipt = await waitForPeerReceipt(transcriptPath, runtime, reservation.messageId, toInt(args['timeout-ms'], DEFAULT_WAIT_TIMEOUT_MS), offset);
+      receipt = await waitForPeerReceipt(transcriptPath, runtime, reservation.messageId, toInt(args['timeout-ms'], DEFAULT_WAIT_TIMEOUT_MS), offset, { requireFinal: true });
       await markPeerMessage(reservation.recordPath, reservation.messageId, 'confirmed');
     } catch (error) {
       await markPeerMessage(reservation.recordPath, reservation.messageId, error.details?.delivery || 'unknown');
@@ -2681,9 +2729,10 @@ async function cmdPeerReceipt(args, surface) {
   if (surface !== "code" || !(args["session-id"] || args.sessionId) || !args["message-id"]) throw new CliError("Code peer-receipt requires --session-id and --message-id");
   const session = resolveSession(surface, args);
   const record = findPeerMessageRecord(session.cliSessionId, args["message-id"]);
-  const receipt = peerReceipt(createTranscriptTail(codeTranscriptPath(session))(), session.cliSessionId, record.messageId);
+  const receipt = peerReceipt(createTranscriptTail(codeTranscriptPath(session))(), session.cliSessionId, record.messageId, { requireFinal: true });
   if (receipt?.userMessageObserved) await markPeerMessage(record.recordPath, record.messageId, "confirmed");
-  printJson({ ok: true, sessionId: session.cliSessionId, messageId: record.messageId, outboxPath: record.recordPath, delivery: receipt ? (receipt.assistantReplyObserved ? "transcript-confirmed" : "transcript-confirmed-awaiting-reply") : "unknown", receipt });
+  const delivery = receipt ? (receipt.assistantReplyObserved ? "transcript-confirmed" : "transcript-confirmed-awaiting-reply") : record.state === 'not-sent' ? 'not-sent' : 'unknown';
+  printJson({ ok: true, sessionId: session.cliSessionId, messageId: record.messageId, outboxPath: record.recordPath, delivery, receipt });
 }
 
 async function sessionAction(args, surface, payload) {
@@ -3012,6 +3061,7 @@ async function cmdStart(args, surface, rest) {
 }
 
 async function cmdSend(args, surface, rest) {
+  if (toBool(args["dry-run"])) throw new CliError("send does not support --dry-run; no message was sent", 2, { delivery: "not-sent" });
   if (!(args["session-id"] || args.sessionId)) throw new CliError("send requires an explicit --session-id; newest or focused sessions are never inferred");
   const prompt = readPrompt(args, rest);
   if (!prompt.trim()) throw new CliError("send requires --prompt TEXT, --prompt-file PATH, or positional text");
@@ -3111,6 +3161,22 @@ async function cmdWait(args, surface) {
 }
 
 async function cmdSelftest() {
+  const transcriptTestRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'triangle-created-transcript-'));
+  const encodedFolder = path.join(transcriptTestRoot, 'encoded-folder');
+  const transcriptTestId = '11111111-2222-4333-8444-555555555555';
+  const transcriptTestFile = path.join(encodedFolder, `${transcriptTestId}.jsonl`);
+  try {
+    fs.mkdirSync(encodedFolder);
+    fs.writeFileSync(transcriptTestFile, JSON.stringify({ sessionId: transcriptTestId, cwd: 'C:\\Projects\\병원' }) + '\n');
+    assert(createdTranscriptPath('C:\\Projects\\병원', transcriptTestId, transcriptTestRoot) === transcriptTestFile,
+      'created transcript resolves an encoded Unicode project folder using exact session and cwd');
+    assert(createdTranscriptPath('C:\\Projects\\other', transcriptTestId, transcriptTestRoot) !== transcriptTestFile,
+      'created transcript rejects a different project folder');
+  } finally {
+    if (fs.existsSync(transcriptTestFile)) fs.unlinkSync(transcriptTestFile);
+    if (fs.existsSync(encodedFolder)) fs.rmdirSync(encodedFolder);
+    fs.rmdirSync(transcriptTestRoot);
+  }
   assert(peerPermissionHoldRisk("bypass", "acceptEdits") !== null, "bypass sender to acceptEdits receiver is flagged as held");
   assert(peerPermissionHoldRisk("bypass", "bypassPermissions") === null, "matching bypass modes are not flagged");
   assert(peerPermissionHoldRisk("prompting", "acceptEdits") === null, "prompting sender is not flagged");
@@ -3168,6 +3234,11 @@ async function cmdSelftest() {
   assert(runtimeVerifiedStdinProcess(registrySession, [initialChild], registryRuntime, { ...registryProbe, sessionId: "other-session" }) === null, "different live session rejected");
   assert(runtimeVerifiedStdinProcess(registrySession, [initialChild], { ...registryRuntime, cwd: "C:\\other" }, registryProbe) === null, "different checkout rejected");
   assert(runtimeVerifiedStdinProcess(registrySession, [resumedChild], registryRuntime, registryProbe) === null, "registry path does not override explicit command-line identity");
+  const rewoundSession = { ...registrySession, priorCliSessionIds: ['earlier'], rewindEdges: [{ parent: 'earlier', child: registrySession.cliSessionId }] };
+  const rewoundChild = { ...initialChild, CommandLine: `${initialChild.CommandLine} --resume earlier` };
+  assert(runtimeVerifiedStdinProcess(rewoundSession, [rewoundChild], registryRuntime, registryProbe) === rewoundChild, "verified rewind ancestor accepted");
+  assert(runtimeVerifiedStdinProcess({ ...rewoundSession, rewindEdges: [] }, [rewoundChild], registryRuntime, registryProbe) === null, "unconnected previous ID rejected");
+  assert(runtimeVerifiedStdinProcess({ ...rewoundSession, rewindEdges: [...rewoundSession.rewindEdges, { parent: 'other', child: registrySession.cliSessionId }] }, [rewoundChild], registryRuntime, registryProbe) === null, "ambiguous ancestry rejected");
   assert(runtimeVerifiedStdinProcess(registrySession, [initialChild, initialChild], registryRuntime, registryProbe) === null, "ambiguous process inventory rejected");
   assert(runtimeVerifiedStdinProcess(registrySession, [{ ...initialChild, CommandLine: "claude.exe" }], registryRuntime, registryProbe) === null, "non-streaming child rejected");
   const cwd = "C:\\Users\\USER\\Desktop\\Projects\\SEMI";

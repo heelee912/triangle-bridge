@@ -8,6 +8,8 @@ import path from 'node:path';
 import { buildVisibleUserFrame, chooseDesktopSendTransport } from './claude_visible_transport.mjs';
 import { permissionSettings, setDesktopPermissions } from './codex_desktop_settings.mjs';
 import { ensureDesktopReady } from './desktop_lifecycle.mjs';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 
 for (const app of ['codex', 'claude', 'antigravity']) {
   test(`${app} reuses a ready desktop app without launching it`, async () => {
@@ -194,4 +196,63 @@ test('skill installation copies all runtime dependencies to arbitrary homes and 
   fs.writeFileSync(untouched, 'preserved');
   installSkills({ home, codexHome: custom });
   assert.equal(fs.readFileSync(untouched, 'utf8'), 'preserved');
+});
+
+test('Claude rejects unobserved stdin names instead of guessing from other pipes', { skip: process.platform !== 'win32' }, async () => {
+  const { runHiddenPowerShell } = await import('./hidden_powershell.mjs');
+  const source = fs.readFileSync(new URL('./claude_live_stdin.ps1', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const start = source.indexOf("$src = @'\n") + "$src = @'\n".length;
+  const end = source.indexOf("\n'@\n", start);
+  assert.ok(start > 0 && end > start);
+  const encoded = Buffer.from(source.slice(start, end), 'utf8').toString('base64');
+  const command = [
+    "$src=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('" + encoded + "'))",
+    'Add-Type -TypeDefinition $src',
+    '$slash=[string][char]92',
+    "$right=$slash+'Device'+$slash+'NamedPipe'+$slash+'uv'+$slash+'9-19400'",
+    '$good=[ClaudeLiveStdinWriter]::VerifiedStdinPipeName(19400,$right)',
+    '$timeout=$false; try { [ClaudeLiveStdinWriter]::VerifiedStdinPipeName(19400,"TIMEOUT") | Out-Null } catch { $timeout=$true }',
+    '$wrong=$false; try { [ClaudeLiveStdinWriter]::VerifiedStdinPipeName(123,$right) | Out-Null } catch { $wrong=$true }',
+    '$multiple=$false; try { [ClaudeLiveStdinWriter]::SelectStdinPipe($right,[string[]]@($right,$right)) | Out-Null } catch { $multiple=$true }',
+    '[pscustomobject]@{good=$good;timeout=$timeout;wrong=$wrong;multiple=$multiple} | ConvertTo-Json -Compress'
+  ].join('; ');
+  const output=JSON.parse(runHiddenPowerShell(['-Command',command],{encoding:'utf8',timeout:30000}));
+  assert.equal(output.good, String.raw`\Device\NamedPipe\uv\9-19400`);
+  assert.equal(output.timeout,true); assert.equal(output.wrong,true); assert.equal(output.multiple,true);
+});
+
+test('pipe selection binds the target child and never writes to a sibling', { skip: process.platform !== 'win32', timeout: 90000 }, async t => {
+  const { runHiddenPowerShell } = await import('./hidden_powershell.mjs');
+  const childCode = `process.stdout.write('READY\\n');process.stdin.on('data',d=>process.stdout.write('INPUT:'+d.toString()));`;
+  const children = [0, 1].map(() => spawn(process.execPath, ['-e', childCode], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] }));
+  t.after(() => { for (const child of children) child.kill(); });
+  const output = ['', ''];
+  for (let i = 0; i < children.length; i++) children[i].stdout.on('data', data => { output[i] += data.toString(); });
+  await Promise.all(children.map(child => once(child.stdout, 'data')));
+  const source = fs.readFileSync(new URL('./claude_live_stdin.ps1', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
+  const marker = "$src = @'\n", start = source.indexOf(marker) + marker.length, end = source.indexOf("\n'@\n", start);
+  assert.ok(start >= marker.length && end > start);
+  const encoded = Buffer.from(source.slice(start, end), 'utf8').toString('base64');
+  const command = [
+    "$ErrorActionPreference='Stop'",
+    `$src=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encoded}'))`,
+    'Add-Type -TypeDefinition $src',
+    `$start1=([Diagnostics.Process]::GetProcessById(${children[0].pid})).StartTime.ToUniversalTime().ToFileTimeUtc().ToString()`,
+    `$wrong=[ClaudeLiveStdinWriter]::Send(${process.pid},${children[0].pid},'1','fixture-wrong',$true) | ConvertFrom-Json`,
+    `$sent=[ClaudeLiveStdinWriter]::Send(${process.pid},${children[0].pid},$start1,'fixture-one',$false) | ConvertFrom-Json`,
+    '[pscustomobject]@{wrong=$wrong;sent=$sent} | ConvertTo-Json -Depth 5 -Compress',
+  ].join('; ');
+  const result = JSON.parse(runHiddenPowerShell(['-Command', command], { encoding: 'utf8', timeout: 80000 }));
+  assert.equal(result.wrong.delivery, 'not-sent');
+  assert.equal(result.sent.ok, true);
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.match(output[0], /INPUT:fixture-one/);
+  assert.doesNotMatch(output[1], /INPUT:/);
+});
+
+test('Claude send rejects unsupported dry-run without contacting a session', () => {
+  const script = new URL('./claude_code_bridge.mjs', import.meta.url);
+  const result = spawnSync(process.execPath, [script.pathname.replace(/^\/(\w:)/, '$1'), 'code', 'send', '--session-id', 'missing', '--prompt', 'test', '--dry-run', '--json'], { encoding: 'utf8', windowsHide: true });
+  assert.equal(result.status, 2);
+  assert.equal(JSON.parse(result.stdout).details.delivery, 'not-sent');
 });

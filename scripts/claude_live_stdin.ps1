@@ -1,6 +1,8 @@
 param(
   [Parameter(Mandatory = $true)][int]$ParentPid,
   [Parameter(Mandatory = $true)][int]$ChildPid,
+  [Parameter(Mandatory = $true)][string]$ExpectedStart,
+  [Parameter(Mandatory = $true)][string]$ExpectedSessionId,
   [string]$JsonLine,
   [string]$JsonLineBase64,
   [switch]$StdinBase64,
@@ -67,6 +69,12 @@ public static class ClaudeLiveStdinWriter {
     public IntPtr Buffer;
   }
 
+  [StructLayout(LayoutKind.Sequential)]
+  struct IO_STATUS_BLOCK {
+    public IntPtr Status;
+    public IntPtr Information;
+  }
+
   const int SystemExtendedHandleInformation = 64;
   const int ProcessBasicInformation = 0;
   const int ObjectNameInformation = 1;
@@ -82,6 +90,8 @@ public static class ClaudeLiveStdinWriter {
   static extern int NtQueryInformationProcess(IntPtr p, int c, ref PROCESS_BASIC_INFORMATION i, int l, out int r);
   [DllImport("ntdll.dll")]
   static extern int NtQueryObject(IntPtr handle, int infoClass, IntPtr info, int infoLength, ref int returnLength);
+  [DllImport("ntdll.dll")]
+  static extern int NtQueryInformationFile(IntPtr handle, out IO_STATUS_BLOCK status, IntPtr info, int length, int infoClass);
   [DllImport("kernel32.dll", SetLastError=true)]
   static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
   [DllImport("kernel32.dll", SetLastError=true)]
@@ -96,6 +106,8 @@ public static class ClaudeLiveStdinWriter {
   static extern uint GetFileType(IntPtr handle);
   [DllImport("kernel32.dll", SetLastError=true)]
   static extern bool GetNamedPipeInfo(IntPtr pipe, out uint flags, IntPtr outBufferSize, IntPtr inBufferSize, IntPtr maxInstances);
+  [DllImport("kernel32.dll", EntryPoint="GetNamedPipeInfo", SetLastError=true)]
+  static extern bool GetPipeDetails(IntPtr pipe, out uint flags, out uint outSize, out uint inSize, out uint maxInstances);
   const uint PIPE_SERVER_END = 1;
   [DllImport("kernel32.dll", SetLastError=true)]
   static extern bool WriteFile(IntPtr handle, byte[] buffer, uint bytesToWrite, out uint bytesWritten, IntPtr overlapped);
@@ -212,6 +224,17 @@ public static class ClaudeLiveStdinWriter {
     }
   }
 
+  static uint QueryChildHandleFileType(int childPid, ulong handleValue) {
+    IntPtr process = OpenProcess(PROCESS_DUP_HANDLE, false, childPid);
+    if (process == IntPtr.Zero) throw new Exception("Cannot inspect child handle");
+    try {
+      IntPtr duplicate;
+      if (!DuplicateHandle(process, new IntPtr(unchecked((long)handleValue)), GetCurrentProcess(), out duplicate, 0, false, DUPLICATE_SAME_ACCESS))
+        throw new Exception("Cannot duplicate child standard handle");
+      try { return GetFileType(duplicate); } finally { CloseHandle(duplicate); }
+    } finally { CloseHandle(process); }
+  }
+
   const string LibuvPipePrefix = "\\Device\\NamedPipe\\uv\\";
 
   static ulong ParseLibuvPipeIndex(int parentPid, string pipeName, string label) {
@@ -227,17 +250,9 @@ public static class ClaudeLiveStdinWriter {
     return index;
   }
 
-  // libuv names each pipe uv\<counter>-<parentPid> and creates a child's stdin, stdout and
-  // stderr back to back, so stdin is the index just before stdout. The parent's first spawn
-  // underflows that counter to UInt64.MaxValue. The child's own stdin name usually cannot be
-  // read because the child holds it in a blocking read, so the adjacent names are the evidence.
-  public static string ExpectedStdinPipeName(int parentPid, string stdoutName, string stderrName) {
-    ulong stdoutIndex = ParseLibuvPipeIndex(parentPid, stdoutName, "stdout");
-    ulong stderrIndex = ParseLibuvPipeIndex(parentPid, stderrName, "stderr");
-    if (stderrIndex != unchecked(stdoutIndex + 1)) {
-      throw new Exception("Child stdout and stderr pipes are not adjacent (" + stdoutName + ", " + stderrName + "); refusing to infer stdin.");
-    }
-    return LibuvPipePrefix + unchecked(stdoutIndex - 1).ToString() + "-" + parentPid.ToString();
+  public static string VerifiedStdinPipeName(int parentPid, string name) {
+    ParseLibuvPipeIndex(parentPid, name, "stdin");
+    return name;
   }
 
   public static int SelectStdinPipe(string expectedStdinName, string[] parentPipeNames) {
@@ -251,16 +266,50 @@ public static class ClaudeLiveStdinWriter {
     return selected;
   }
 
-  public static string Send(int parentPid, int childPid, string jsonLine, bool dryRun) {
+  static bool PipeUsedByProcess(IntPtr pipe, int processId) {
+    bool used = false;
+    Exception failure = null;
+    var thread = new Thread(() => {
+      const int size = 65536;
+      IntPtr buffer = Marshal.AllocHGlobal(size);
+      try {
+        IO_STATUS_BLOCK status;
+        int result = NtQueryInformationFile(pipe, out status, buffer, size, 47);
+        if (result != 0) throw new Exception("Cannot verify pipe users: NTSTATUS 0x" + result.ToString("X8"));
+        int count = Marshal.ReadInt32(buffer);
+        int offset = IntPtr.Size;
+        if (count < 0 || count > (size - offset) / IntPtr.Size) throw new Exception("Invalid pipe user list");
+        for (int i = 0; i < count; i++)
+          if (Marshal.ReadIntPtr(buffer, offset + i * IntPtr.Size).ToInt64() == processId) { used = true; break; }
+      } catch (Exception ex) { failure = ex; }
+      finally { Marshal.FreeHGlobal(buffer); }
+    });
+    thread.IsBackground = true;
+    thread.Start();
+    if (!thread.Join(300)) throw new Exception("Timed out verifying pipe users");
+    if (failure != null) throw failure;
+    return used;
+  }
+
+  static void VerifyProcessStart(int pid, string expectedStart) {
+    using (var process = System.Diagnostics.Process.GetProcessById(pid)) {
+      if (process.StartTime.ToUniversalTime().ToFileTimeUtc().ToString() != expectedStart)
+        throw new Exception("Claude session process changed before the write");
+    }
+  }
+
+  public static string Send(int parentPid, int childPid, string expectedStart, string jsonLine, bool dryRun) {
+    bool writing = false;
+    try {
     var standardHandles = ReadChildStandardHandles(childPid);
+    if (QueryChildHandleFileType(childPid, standardHandles["stdin"]) != FILE_TYPE_PIPE)
+      throw new Exception("Claude stdin is not a pipe");
     string stdoutName = QueryChildHandleName(childPid, standardHandles["stdout"]);
     string stderrName = QueryChildHandleName(childPid, standardHandles["stderr"]);
-    string stdinName = ExpectedStdinPipeName(parentPid, stdoutName, stderrName);
-    string observedStdinName = QueryChildHandleName(childPid, standardHandles["stdin"]);
-    if (observedStdinName.StartsWith("\\Device\\", StringComparison.OrdinalIgnoreCase) &&
-        !String.Equals(observedStdinName, stdinName, StringComparison.OrdinalIgnoreCase)) {
-      throw new Exception("Child stdin " + observedStdinName + " disagrees with inferred " + stdinName + "; refusing to send.");
-    }
+    VerifyProcessStart(childPid, expectedStart);
+    ParseLibuvPipeIndex(parentPid, stdoutName, "stdout");
+    ParseLibuvPipeIndex(parentPid, stderrName, "stderr");
+    if (String.Equals(stdoutName, stderrName, StringComparison.OrdinalIgnoreCase)) throw new Exception("Claude stdout and stderr are not distinct");
 
     var handles = QueryHandles();
     IntPtr parent = OpenProcess(PROCESS_DUP_HANDLE, false, parentPid);
@@ -269,6 +318,7 @@ public static class ClaudeLiveStdinWriter {
     var parentPipes = new List<IntPtr>();
     var parentPipeNames = new List<string>();
     var parentHandleValues = new List<ulong>();
+    int stdoutCount = 0, stderrCount = 0;
     try {
       foreach (var entry in handles) {
         if (entry.UniqueProcessId.ToUInt64() != (ulong)parentPid) continue;
@@ -280,10 +330,22 @@ public static class ClaudeLiveStdinWriter {
         }
         try {
           if (GetFileType(duplicate) != FILE_TYPE_PIPE) continue;
+          uint pipeFlags, outSize, inSize, maxInstances;
+          if (!GetPipeDetails(duplicate, out pipeFlags, out outSize, out inSize, out maxInstances) || (pipeFlags & PIPE_SERVER_END) == 0) continue;
           string name = QueryNameWithTimeout(duplicate, 150);
-          if (!String.Equals(name, stdinName, StringComparison.OrdinalIgnoreCase)) continue;
-          uint pipeFlags;
-          if (!GetNamedPipeInfo(duplicate, out pipeFlags, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero) || (pipeFlags & PIPE_SERVER_END) == 0) continue;
+          if (name == "TIMEOUT") {
+            if (PipeUsedByProcess(duplicate, childPid)) throw new Exception("Cannot name a pipe used by the target process");
+            continue;
+          }
+          if (!name.StartsWith(LibuvPipePrefix, StringComparison.OrdinalIgnoreCase)) {
+            if (PipeUsedByProcess(duplicate, childPid)) throw new Exception("The target uses an additional parent pipe; refusing ambiguous selection");
+            continue;
+          }
+          ParseLibuvPipeIndex(parentPid, name, "parent");
+          if (!PipeUsedByProcess(duplicate, childPid)) continue;
+          if (maxInstances != 1) throw new Exception("Pipe name has multiple allowed instances; refusing to send");
+          if (String.Equals(name, stdoutName, StringComparison.OrdinalIgnoreCase)) { stdoutCount++; continue; }
+          if (String.Equals(name, stderrName, StringComparison.OrdinalIgnoreCase)) { stderrCount++; continue; }
           parentPipes.Add(duplicate);
           parentPipeNames.Add(name);
           parentHandleValues.Add(handleValue);
@@ -292,7 +354,14 @@ public static class ClaudeLiveStdinWriter {
           if (duplicate != IntPtr.Zero) CloseHandle(duplicate);
         }
       }
-      int selected = SelectStdinPipe(stdinName, parentPipeNames.ToArray());
+      if (stdoutCount != 1 || stderrCount != 1 || parentPipes.Count != 1)
+        throw new Exception("Expected exactly the target process's stdout, stderr, and one input pipe; refusing to send");
+      int selected = SelectStdinPipe(parentPipeNames[0], parentPipeNames.ToArray());
+      string stdinName = VerifiedStdinPipeName(parentPid, parentPipeNames[selected]);
+      VerifyProcessStart(childPid, expectedStart);
+      var currentHandles = ReadChildStandardHandles(childPid);
+      if (currentHandles["stdin"] != standardHandles["stdin"] || currentHandles["stdout"] != standardHandles["stdout"] || currentHandles["stderr"] != standardHandles["stderr"] || !PipeUsedByProcess(parentPipes[selected], childPid))
+        throw new Exception("Claude standard handles or pipe users changed before the write");
       if (dryRun) {
         return "{\"ok\":true,\"dryRun\":true,\"target\":\"" + EscapeJson(stdinName) +
           "\",\"stdout\":\"" + EscapeJson(stdoutName) +
@@ -301,8 +370,9 @@ public static class ClaudeLiveStdinWriter {
       }
       byte[] bytes = Encoding.UTF8.GetBytes(jsonLine + "\n");
       uint written;
+      writing = true;
       bool ok = WriteFile(parentPipes[selected], bytes, (uint)bytes.Length, out written, IntPtr.Zero);
-      int error = Marshal.GetLastWin32Error();
+      int error = ok ? 0 : Marshal.GetLastWin32Error();
       return "{\"ok\":" + (ok && written == bytes.Length ? "true" : "false") +
         ",\"target\":\"" + EscapeJson(stdinName) +
         "\",\"stdout\":\"" + EscapeJson(stdoutName) +
@@ -315,6 +385,10 @@ public static class ClaudeLiveStdinWriter {
       foreach (var pipe in parentPipes) CloseHandle(pipe);
       CloseHandle(parent);
     }
+    } catch (Exception ex) {
+      return "{\"ok\":false,\"delivery\":\"" + (writing ? "unknown" : "not-sent") +
+        "\",\"error\":\"" + EscapeJson(ex.Message) + "\"}";
+    }
   }
 
   static string EscapeJson(string value) {
@@ -325,4 +399,7 @@ public static class ClaudeLiveStdinWriter {
 '@
 
 Add-Type -TypeDefinition $src
-[ClaudeLiveStdinWriter]::Send($ParentPid, $ChildPid, $JsonLine, [bool]$DryRun)
+$recordPath = Join-Path $env:USERPROFILE ".claude\sessions\$ChildPid.json"
+$record = Get-Content -LiteralPath $recordPath -Raw -Encoding UTF8 | ConvertFrom-Json
+if ($record.pid -ne $ChildPid -or $record.sessionId -cne $ExpectedSessionId -or $record.procStart -ne $ExpectedStart) { throw 'Claude runtime identity changed before pipe selection' }
+[ClaudeLiveStdinWriter]::Send($ParentPid, $ChildPid, $ExpectedStart, $JsonLine, [bool]$DryRun)

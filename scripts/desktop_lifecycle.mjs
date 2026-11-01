@@ -1,5 +1,6 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { runHiddenPowerShell } from './hidden_powershell.mjs';
 
 const exec = promisify(execFile);
 const apps = new Set(['codex', 'claude', 'antigravity']);
@@ -55,7 +56,7 @@ export async function desktopInstallation(app) {
   if (!apps.has(app)) throw new Error(`Unknown desktop app: ${app}`);
   if (process.platform !== 'win32') throw new Error('Desktop app startup currently requires Windows');
   try {
-    const { stdout } = await exec('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', installationScript],
+    const stdout = runHiddenPowerShell(['-NoProfile', '-NonInteractive', '-Command', installationScript],
       { env: { ...process.env, TRIANGLE_DESKTOP_APP: app }, encoding: 'utf8', windowsHide: true, timeout: 15000 });
     return JSON.parse(stdout.trim());
   } catch (error) {
