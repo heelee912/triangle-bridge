@@ -3167,8 +3167,8 @@ async function cmdSelftest() {
   const transcriptTestFile = path.join(encodedFolder, `${transcriptTestId}.jsonl`);
   try {
     fs.mkdirSync(encodedFolder);
-    fs.writeFileSync(transcriptTestFile, JSON.stringify({ sessionId: transcriptTestId, cwd: 'C:\\Projects\\병원' }) + '\n');
-    assert(createdTranscriptPath('C:\\Projects\\병원', transcriptTestId, transcriptTestRoot) === transcriptTestFile,
+    fs.writeFileSync(transcriptTestFile, JSON.stringify({ sessionId: transcriptTestId, cwd: 'C:\\Projects\\한글_試験' }) + '\n');
+    assert(createdTranscriptPath('C:\\Projects\\한글_試験', transcriptTestId, transcriptTestRoot) === transcriptTestFile,
       'created transcript resolves an encoded Unicode project folder using exact session and cwd');
     assert(createdTranscriptPath('C:\\Projects\\other', transcriptTestId, transcriptTestRoot) !== transcriptTestFile,
       'created transcript rejects a different project folder');
