@@ -7,7 +7,13 @@ import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { AppToolPipe, encodeFrame, toolParams, decodeToolResult, openAppTools, loadPrompt, projectPublishedReply } from './codex_app_pipe.mjs';
+import { AppToolPipe, encodeFrame, toolParams, decodeToolResult, openAppTools, loadPrompt, projectPublishedReply, desktopPipeNames } from './codex_app_pipe.mjs';
+
+test('discovers dedicated app tools before legacy browser endpoints', () => {
+  const id = '01234567-89ab-cdef-0123-456789abcdef';
+  assert.deepEqual(desktopPipeNames([`codex-browser-use-${id}`, `codex-app-tools-${id}`, 'codex-app-tools-invalid']),
+    [`codex-app-tools-${id}`, `codex-browser-use-${id}`]);
+});
 
 async function server(t, onRequest) {
   const endpoint = process.platform === 'win32'

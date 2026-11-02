@@ -136,10 +136,14 @@ export function projectPublishedReply(snapshot, threadId, hostId, filter) {
     ...(message.phase ? { phase: message.phase } : {}), text: message.text } };
 }
 
+export function desktopPipeNames(names) {
+  return names.filter(name => /^codex-(?:app-tools|browser-use)(?:-|[\\/])[0-9a-f-]{36}$/i.test(name))
+    .sort((a, b) => Number(!/^codex-app-tools/i.test(a)) - Number(!/^codex-app-tools/i.test(b)));
+}
+
 function desktopPipeEndpoints() {
   if (process.platform !== 'win32') throw new Error('App-tool pipe discovery currently requires Windows');
-  return fs.readdirSync('\\\\.\\pipe\\')
-    .filter(name => /^codex-browser-use(?:-|[\\/])[0-9a-f-]{36}$/i.test(name))
+  return desktopPipeNames(fs.readdirSync('\\\\.\\pipe\\'))
     .map(name => '\\\\.\\pipe\\' + name);
 }
 
